@@ -1,0 +1,35 @@
+{
+    "name": "zwwl/workflow-demo",
+    "description": "服务端工作流引擎最小 demo:Hyperf 调度器 + 可序列化 Context + 多语言代码节点沙箱",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.1",
+        "ext-swoole": ">=5.0",
+        "hyperf/framework": "~3.1.0",
+        "hyperf/config": "~3.1.0",
+        "hyperf/di": "~3.1.0",
+        "hyperf/engine": "^2.10",
+        "hyperf/command": "~3.1.0",
+        "hyperf/server": "~3.1.0",
+        "hyperf/http-server": "~3.1.0",
+        "hyperf/laminas-mime": "^3.0",
+        "hyperf/logger": "~3.1.0",
+        "symfony/process": "^7.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "app/"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "repositories": {
+        "packagist": {
+            "type": "composer",
+            "url": "https://mirrors.aliyun.com/composer/"
+        }
+    }
+}

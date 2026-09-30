@@ -1,0 +1,89 @@
+{
+  "id": "fail-then-resume",
+  "comment": "resume 演示流:bad 节点默认抛异常 → 任务失败但 checkpoint 已保留 start 执行状态;修复 DSL(把 raise 换成 return)后 workflow resume <taskID> 从 bad 节点继续,不再重跑 start",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "data": {
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "type": "number"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "bad",
+      "type": "code",
+      "data": {
+        "title": "待修复节点",
+        "script": {
+          "language": "python",
+          "content": "def main(params):\n    raise RuntimeError('boom: node not ready')\n"
+        },
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "type": "number"
+            }
+          }
+        },
+        "inputsValues": {
+          "value": {
+            "type": "ref",
+            "content": [
+              "start",
+              "value"
+            ]
+          }
+        },
+        "outputsSchema": {
+          "type": "object",
+          "properties": {
+            "doubled": {
+              "type": "number"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "end",
+      "type": "end",
+      "data": {
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "doubled": {
+              "type": "number"
+            }
+          }
+        },
+        "inputsValues": {
+          "doubled": {
+            "type": "ref",
+            "content": [
+              "bad",
+              "doubled"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "start",
+      "to": "bad"
+    },
+    {
+      "from": "bad",
+      "to": "end"
+    }
+  ]
+}

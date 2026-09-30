@@ -1,0 +1,6 @@
+vendor/
+vendor.box/
+runtime/
+.runs/
+*.log
+.DS_Store

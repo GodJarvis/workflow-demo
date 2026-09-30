@@ -1,0 +1,73 @@
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "comment": "demo 级 syscall 白名单:覆盖 python3/node/php CLI 运行 + 文件 IO + 事件循环;默认 EPERM。execve 必须放行(容器入口拉起解释器本身需要 exec;fork 炸弹由 pids-limit + 无 clone/fork 双重拦截)。有意禁止:clone/fork/vfork(防逃逸)、socket 族(禁网)、mount/ptrace 等。若真实运行报 EPERM,按 stderr 提示增补对应 syscall。",
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"]
+    },
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": ["SCMP_ARCH_ARM"]
+    }
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "read", "write", "open", "openat", "openat2", "close", "stat", "fstat", "lstat",
+        "newfstatat", "statx", "lseek", "readlink", "readlinkat", "getcwd", "chdir",
+        "pread64", "pwrite64", "readv", "writev", "getdents64", "getdents",
+        "access", "faccessat", "faccessat2", "fcntl", "dup", "dup2", "dup3",
+        "pipe", "pipe2", "ftruncate", "memfd_create", "fstatfs", "statfs", "fsync", "fdatasync",
+        "execve", "execveat"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "names": [
+        "mmap", "munmap", "mprotect", "mremap", "madvise", "mbind", "get_mempolicy",
+        "membarrier", "mincore", "msync", "prctl"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "names": [
+        "brk", "arch_prctl", "set_tid_address", "set_robust_list", "get_robust_list",
+        "rseq", "futex", "sched_getaffinity", "sched_yield", "uname", "sysinfo",
+        "prlimit64", "getrlimit", "getrusage",
+        "clone", "clone3"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "comment": "clone/clone3:pthread/V8 平台线程创建必需;进程爆炸由 pids-limit + 非 root 双重兜底(seccomp 无法按 flags 区分线程/进程)"
+    },
+    {
+      "names": [
+        "exit", "exit_group", "restart_syscall",
+        "rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "sigaltstack", "tgkill"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "names": [
+        "clock_gettime", "clock_gettime64", "clock_getres", "clock_getres_time64",
+        "gettimeofday", "nanosleep", "clock_nanosleep", "clock_nanosleep_time64",
+        "getrandom", "getentropy"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "names": [
+        "getpid", "getppid", "gettid", "getuid", "geteuid", "getgid", "getegid", "ioctl"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "names": [
+        "epoll_create1", "epoll_create", "epoll_ctl", "epoll_wait", "epoll_pwait",
+        "epoll_pwait2", "eventfd", "eventfd2", "poll", "ppoll"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}

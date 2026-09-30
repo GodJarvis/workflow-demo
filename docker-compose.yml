@@ -1,0 +1,43 @@
+services:
+  # 引擎容器:复用现成 PHP8.4 + Swoole + Hyperf 镜像,常驻后 docker exec 进去执行
+  wf-engine:
+    container_name: "wf-engine"
+    image: hub.wozhangwan.com/zwwl/php84-swoole-hyperf:v1
+    environment:
+      - APP_ENV=develop
+      - TIMEZONE=Asia/Shanghai
+    ports:
+      - "49601:9501"
+    volumes:
+      - $PWD:/var/project/workflow-demo
+      # 引擎通过 docker.sock 调度宿主机 docker daemon 起一次性沙箱容器
+      # ⚠️ demo 简化做法:生产环境应替换为独立的 sandbox-manager 服务(gRPC),避免挂载 socket
+      - /var/run/docker.sock:/var/run/docker.sock
+    working_dir: /var/project/workflow-demo
+    # process 档(进程级沙箱)需要容器内具备三语言解释器 + setpriv;装过则跳过
+    command: >
+      sh -c "command -v setpriv >/dev/null 2>&1
+      || (sed -i 's#dl-cdn.alpinelinux.org#mirrors.ustc.edu.cn#g' /etc/apk/repositories
+          && apk add --no-cache python3 nodejs util-linux);
+      tail -f /dev/null"
+    restart: always
+
+  # 以下为三个语言沙箱镜像的构建期定义(docker compose build wf-sandbox-python 等)
+  # 运行期不需要常驻:由引擎每次 docker run --rm 一次性拉起
+  wf-sandbox-python:
+    build:
+      context: ./docker
+      dockerfile: sandbox-python/Dockerfile
+    image: wf-sandbox-python:demo
+
+  wf-sandbox-node:
+    build:
+      context: ./docker
+      dockerfile: sandbox-node/Dockerfile
+    image: wf-sandbox-node:demo
+
+  wf-sandbox-php:
+    build:
+      context: ./docker
+      dockerfile: sandbox-php/Dockerfile
+    image: wf-sandbox-php:demo
