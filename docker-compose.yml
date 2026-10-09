@@ -16,10 +16,7 @@ services:
     working_dir: /var/project/workflow-demo
     # process 档(进程级沙箱)需要容器内具备三语言解释器 + setpriv;装过则跳过
     command: >
-      sh -c "command -v setpriv >/dev/null 2>&1
-      || (sed -i 's#dl-cdn.alpinelinux.org#mirrors.ustc.edu.cn#g' /etc/apk/repositories
-          && apk add --no-cache python3 nodejs util-linux);
-      tail -f /dev/null"
+      sh -c "command -v setpriv >/dev/null 2>&1 || (sed -i 's#dl-cdn.alpinelinux.org#mirrors.ustc.edu.cn#g' /etc/apk/repositories && apk add --no-cache python3 nodejs util-linux);tail -f /dev/null"
     restart: always
 
   # 以下为三个语言沙箱镜像的构建期定义(docker compose build wf-sandbox-python 等)
