@@ -37,7 +37,7 @@ class CodeExecutor implements NodeExecutorInterface
     private string $runsDir;
 
     /** @var array<string, string> 节点级沙箱档位白名单(防 DSL 随意指定驱动名) */
-    private const DRIVERS = ['docker', 'process'];
+    private const DRIVERS = ['docker', 'process', 'dify'];
 
     public function __construct()
     {

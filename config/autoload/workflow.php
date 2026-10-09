@@ -30,11 +30,20 @@ return [
         'php'         => 'wf-sandbox-php:demo',
     ],
 
-    // ★ 沙箱档位(教学三档体系的档1/档2):
+    // ★ 沙箱档位(教学三档体系):
     //   'docker'  一次性容器:cgroup/namespace/seccomp 全隔离,冷启动 ~150-300ms(默认)
     //   'process' dify-sandbox 同构的进程级:setpriv 降权 + UID 池 + ulimit,冷启动 ~30-80ms
-    // 节点级可用 data.sandboxDriver 覆盖(同一工作流内混合两档做对比实验)
+    //   'dify'    远程沙箱服务档:HTTP 调用本地部署的 dify-sandbox(Go),生产 sandbox-manager 形态
+    // 节点级可用 data.sandboxDriver 覆盖(同一工作流内混合多档做对比实验)
     'sandbox_driver' => 'docker',
+
+    // dify 档(远程沙箱服务)配置
+    'sandbox_dify' => [
+        // 引擎容器经 host-gateway 访问宿主机上的 dify-sandbox 服务(见 docker-compose.yml extra_hosts)
+        'base_url' => 'http://host.docker.internal:8194',
+        'api_key'  => 'dify-sandbox',   // 服务 conf/config.yaml 的 app.key
+        'timeout'  => 15,
+    ],
 
     // process 档(dify 风格)专属配置
     'sandbox_process' => [

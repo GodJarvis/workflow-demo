@@ -43,21 +43,31 @@ HTTP :9501 ─────────┘        │                    │
 # PHP:             function main(array $params): array
 ```
 
-#### 双档沙箱(docker / process)—— 三档体系的档1与档2
+#### 三档沙箱(docker / process / dify)—— 完整沙箱体系
 
-同一引擎、同一 Runner 文件协议,只有"执行方式"不同,构成控制变量的对比实验:
+同一引擎、同一 Runner 协议,只有"执行方式"不同,构成控制变量的对比实验:
 
-| | `process` 档(dify-sandbox 同构) | `docker` 档(一次性容器) |
-|---|---|---|
-| 隔离单元 | 进程(setpriv 降权 + UID 池 + ulimit) | 容器(namespace/cgroup/seccomp) |
-| 文件系统 | 一次性私有工作目录(权限隔离) | 只读 rootfs + tmpfs + 挂载 /task |
-| 网络 | ❌ 无法禁网(无 namespace) | ✅ `NetworkMode: none` 硬禁 |
-| syscall | ❌ 无 seccomp(PHP 无自装锁机制) | ✅ 白名单 profile,默认 EPERM |
-| 资源 | ulimit -v/-t/-u(V8 需 ≥2G 地址空间) | cgroup 三限额(OOM=137) |
-| 冷启动(实测) | **~35-70ms** | ~130-250ms |
-| 适用 | 内部可信/高频执行 | 开放多租户 |
+| | `process` 档(进程级) | `dify` 档(远程沙箱服务) | `docker` 档(一次性容器) |
+|---|---|---|---|
+| 隔离单元 | 进程(setpriv 降权 + UID 池 + ulimit) | dify-sandbox 服务(chroot+seccomp+UID 池) | 容器(namespace/cgroup/seccomp) |
+| 调用方式 | 本容器 `Coroutine::exec` 子进程 | HTTP `POST /v1/sandbox/run`(host-gateway) | Docker Engine API(curl + unix socket) |
+| 网络 | ❌ 无法禁网 | 服务侧 seccomp 开关 + 代理 | ✅ `NetworkMode: none` 硬禁 |
+| 文件系统 | 一次性私有工作目录 | dify 服务内部临时目录 | 只读 rootfs + tmpfs + 挂载 /task |
+| 语言 | python/js/php | **python/js(上游无 php)** | python/js/php |
+| 冷启动(实测) | ~35-70ms | **~23-30ms** ⚡ | ~130-250ms |
+| 部署形态 | 引擎同进程 | 独立 Go 服务(生产 sandbox-manager 形态) | 引擎经 daemon 拉起 |
+| 适用 | 内部可信/高频 | 服务化解耦/独立扩缩容 | 开放多租户 |
 
-**切换方式**:全局 `config/autoload/workflow.php → 'sandbox_driver'`;节点级 `data.sandboxDriver`(见 `examples/mixed-sandboxes.json`,同一工作流内两档混跑,快照 timeCost 直接对比)。
+**切换方式**:全局 `config/autoload/workflow.php → 'sandbox_driver'`;节点级 `data.sandboxDriver`(见 `examples/mixed-sandboxes.json`:python=dify / js=docker / php=process,一图三档对比)。
+
+**dify 档协议转换**(`DifySandboxDriver.php`,核心教学点):引擎文件协议(code.* + input.json → output.json)与 dify HTTP 协议({language, code} → {stdout, stderr})的适配——params 内联进包装代码(JSON_HEX 转义)、追加 main() 调用与 `__WF_OUTPUT__` 结果标记行、driver 代写 output.json 保持上层零改动。nodejs 侧按 CJS 语义用 Promise 链(dify 以 test.js 普通脚本执行,无顶层 await)。
+
+**dify-sandbox 宿主部署踩坑实录**(服务以 `sudo ./main` 运行于 `:8194`,详见 `/home/zw/goweb/dify-sandbox`):
+
+1. `useradd sandbox(65537)` 需要 root → `sudo useradd -u 65537 sandbox`
+2. `/var/sandbox/{sandbox-python,sandbox-nodejs}` 初始化需要权限 → `sudo mkdir + chown`
+3. **`fs.protected_hardlinks`**:普通用户对 root 属主的系统 .so 无写权限,env.sh 的 `ln -f` EPERM → fallback `cp` 又撞上重复路径(lib-dynload 被 stdlib 和独立路径发现两次)第一轮留下的 444 文件 → 权限不够 panic。根因:官方语义就是容器内 root 运行(chroot/setuid 需要 CAP_SYS_CHROOT),**以 root 跑即全部解决**
+4. busybox 自带阉割版 `setpriv` 不支持 `--reuid`:引擎容器安装检测标志必须用 `python3` 而非 `setpriv`(compose command 已注释)
 
 **process 档与 dify-sandbox 源码对照**(完整注释见 `ProcessSandboxDriver.php` 头部):
 
@@ -102,6 +112,8 @@ docker exec wf-engine sh -c "cd /var/project/workflow-demo && \
 # 双档沙箱对比(教学):同一工作流内 process/docker 混跑,快照 timeCost 直接对比冷启动
 docker exec wf-engine sh -c "cd /var/project/workflow-demo && \
   php bin/hyperf.php workflow run examples/mixed-sandboxes.json --inputs='{\"query\":\"compare sandbox drivers\"}'"
+# ↑ 2026-10 起为三档混合:python=dify 远程服务档 / js=docker 档 / php=process 档
+# 前置:dify-sandbox 服务需在宿主机以 root 运行(sudo ./main,端口 8194)
 
 # 4. HTTP API(启动 Server 后,宿主 49601 端口)
 docker exec -d wf-engine sh -c "cd /var/project/workflow-demo && php bin/hyperf.php start"
@@ -144,10 +156,11 @@ app/Workflow/
 ├── Document/{Document,NodeModel}.php     # DSL → 图模型(prev/next 索引 + 环/起止校验)
 ├── Engine/Engine.php                     # 调度器:汇聚/裁剪/协程并发/checkpoint
 ├── Engine/Executors/{Start,End,Condition,Code}Executor.php
-├── Sandbox/SandboxDriverInterface.php       # ★ 双档沙箱统一协议(文件协议固化)
+├── Sandbox/SandboxDriverInterface.php       # ★ 三档沙箱统一协议(文件协议固化)
 ├── Sandbox/SandboxDriverFactory.php         # 档位选择:全局配置 + 节点级覆盖
 ├── Sandbox/DockerSandboxDriver.php          # 档2:一次性容器(Engine API 直调)
 ├── Sandbox/ProcessSandboxDriver.php         # 档1:进程级(dify 同构,教学注释集大成)
+├── Sandbox/DifySandboxDriver.php            # 档3:远程沙箱服务(HTTP 协议转换核心)
 ├── Sandbox/UidPool.php                      # UID 池(Swoole Channel ≡ dify Go chan 池)
 ├── Snapshot/SnapshotCenter.php           # 逐节点快照 → report.json
 ├── State/WorkflowState.php               # constant/ref/template 解析 + executedNodes

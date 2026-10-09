@@ -1,6 +1,6 @@
 {
   "id": "mixed-sandboxes",
-  "comment": "节点级沙箱档位混合示例(教学):clean(python)走 process 档(进程级,dify 风格,~50ms)、score(js)走 docker 档(一次性容器,~200ms)、reply(php)走 process 档。同一工作流内两档并存,快照 timeCost 直接对比冷启动差异。",
+  "comment": "三档沙箱混合教学示例:clean(python)走 dify 档(远程沙箱服务)、score(js)走 docker 档(一次性容器)、reply(php)走 process 档(进程级)。同一工作流内三档并存,快照 timeCost 直接对比各档耗时。",
   "nodes": [
     {
       "id": "start",
@@ -54,7 +54,7 @@
             }
           }
         },
-        "sandboxDriver": "process"
+        "sandboxDriver": "dify"
       }
     },
     {

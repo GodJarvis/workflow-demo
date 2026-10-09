@@ -26,7 +26,8 @@ class SandboxDriverFactory
         return match ($name) {
             'docker' => new DockerSandboxDriver(),
             'process' => new ProcessSandboxDriver(UidPool::global()),
-            default => throw new \RuntimeException("Unknown sandbox driver '{$name}' (expect docker|process)"),
+            'dify' => new DifySandboxDriver(),
+            default => throw new \RuntimeException("Unknown sandbox driver '{$name}' (expect docker|process|dify)"),
         };
     }
 }
