@@ -142,6 +142,14 @@ docker exec wf-engine sh -c "cd /var/project/workflow-demo && \
 docker exec wf-engine sh -c "cd /var/project/workflow-demo && \
   php bin/hyperf.php workflow run examples/all-languages.json --inputs='{\"query\":\"  hello polyglot workflow  \"}'"
 
+# LLM 节点(mock 模式零依赖;配置 workflow.llm 后走真实 OpenAI 兼容 API)
+docker exec wf-engine sh -c "cd /var/project/workflow-demo && \
+  php bin/hyperf.php workflow run examples/llm-flow.json --inputs='{\"topic\":\"多语言沙箱\"}'"
+
+# 长耗时异步节点:video mock 8s 协程挂起,期间引擎可并发跑其它工作流(见下节)
+docker exec wf-engine sh -c "cd /var/project/workflow-demo && \
+  php bin/hyperf.php workflow run examples/async-video-flow.json --inputs='{\"topic\":\"协程引擎\"}'"
+
 # 短文本 → PHP 兜底分支(JS 节点被裁剪为 skipped)
 docker exec wf-engine sh -c "cd /var/project/workflow-demo && \
   php bin/hyperf.php workflow run examples/first-flow.json --inputs='{\"query\":\"  hi 小主  \"}'"
@@ -193,6 +201,8 @@ app/Workflow/
 ├── Document/{Document,NodeModel}.php     # DSL → 图模型(prev/next 索引 + 环/起止校验)
 ├── Engine/Engine.php                     # 调度器:汇聚/裁剪/协程并发/checkpoint
 ├── Engine/Executors/{Start,End,Condition,Code}Executor.php
+├── Engine/Executors/LLMExecutor.php              # OpenAI 兼容 Chat(mock 可零依赖教学)
+├── Engine/Executors/VideoExecutor.php            # 长耗时异步范型:协程挂起,引擎零改动
 ├── Sandbox/SandboxDriverInterface.php       # ★ 三档沙箱统一协议(文件协议固化)
 ├── Sandbox/SandboxDriverFactory.php         # 档位选择:全局配置 + 节点级覆盖
 ├── Sandbox/DockerSandboxDriver.php          # 档2:一次性容器(Engine API 直调)
@@ -211,6 +221,12 @@ docker/
 ├── sandbox-{python,node,php}/Dockerfile        # 轻量沙箱镜像(ENTRYPOINT 内置 runner)
 └── seccomp-profile.json                         # syscall 白名单
 ```
+
+## 异步长耗时节点(LLM 生视频等)的执行模型
+
+**引擎零改动**:协程模型下,executor 内的协程化等待(`Coroutine::sleep`、协程 hook 的 curl)让出协程、不占 worker——实测 video 节点挂起 8002ms 期间,普通工作流 548ms 照常完成(同 worker 并发)。要点:executor 内禁用阻塞 `sleep`;超时自持(`llm.timeout` / video `totalTimeout`);`workflow_timeout` 放宽或置 -1。
+
+**生产 durable 形态**(未实现,改造清单见教学手册 03§7):任务外置 + 节点 `waiting` 状态 + 定时器轮询 + checkpoint 持久化外部 taskId——解决协程内等待"崩溃即重跑/重复计费"的可靠性问题;同时 `run` 接口宜改为立即返回 taskID 的异步任务式。
 
 ## 已知简化(demo → 生产的差距)
 

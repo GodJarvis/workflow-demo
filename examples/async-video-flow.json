@@ -1,0 +1,135 @@
+{
+  "id": "async-video-flow",
+  "comment": "长耗时异步节点教学示例:llm 生成分镜(mock)→ video 生成(mock 8 秒,协程挂起)→ end。并发验证:video 挂起 8 秒期间,引擎可同时跑完其它工作流(worker 不被阻塞)。",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "data": {
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "storyboard",
+      "type": "llm",
+      "data": {
+        "title": "LLM 生成分镜",
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "type": "string"
+            }
+          }
+        },
+        "inputsValues": {
+          "prompt": {
+            "type": "template",
+            "content": "为主题「{{start.topic}}」生成一个 5 秒视频分镜描述。"
+          }
+        },
+        "outputsSchema": {
+          "type": "object",
+          "properties": {
+            "result": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "render",
+      "type": "video",
+      "data": {
+        "title": "视频生成(异步 8s)",
+        "mockSeconds": 8,
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "type": "string"
+            }
+          }
+        },
+        "inputsValues": {
+          "prompt": {
+            "type": "ref",
+            "content": [
+              "storyboard",
+              "result"
+            ]
+          }
+        },
+        "outputsSchema": {
+          "type": "object",
+          "properties": {
+            "taskId": {
+              "type": "string"
+            },
+            "videoUrl": {
+              "type": "string"
+            },
+            "durationSeconds": {
+              "type": "number"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "end",
+      "type": "end",
+      "data": {
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "videoUrl": {
+              "type": "string"
+            },
+            "taskId": {
+              "type": "string"
+            }
+          }
+        },
+        "inputsValues": {
+          "videoUrl": {
+            "type": "ref",
+            "content": [
+              "render",
+              "videoUrl"
+            ]
+          },
+          "taskId": {
+            "type": "ref",
+            "content": [
+              "render",
+              "taskId"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "start",
+      "to": "storyboard"
+    },
+    {
+      "from": "storyboard",
+      "to": "render"
+    },
+    {
+      "from": "render",
+      "to": "end"
+    }
+  ]
+}

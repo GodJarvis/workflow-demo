@@ -1,0 +1,90 @@
+{
+  "id": "llm-flow",
+  "comment": "LLM 节点示例:start → llm(prompt 用 template 引用上游)→ end。未配置 workflow.llm.base_url/api_key 时自动 mock,配置后走真实 OpenAI 兼容 API。",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "data": {
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "write",
+      "type": "llm",
+      "data": {
+        "title": "LLM 写作",
+        "model": "gpt-4o-mini",
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "systemPrompt": {
+              "type": "string"
+            },
+            "prompt": {
+              "type": "string"
+            }
+          }
+        },
+        "inputsValues": {
+          "systemPrompt": {
+            "type": "constant",
+            "content": "你是一名简洁的文案。"
+          },
+          "prompt": {
+            "type": "template",
+            "content": "为主题「{{start.topic}}」写一句宣传语。"
+          }
+        },
+        "outputsSchema": {
+          "type": "object",
+          "properties": {
+            "result": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "end",
+      "type": "end",
+      "data": {
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "result": {
+              "type": "string"
+            }
+          }
+        },
+        "inputsValues": {
+          "result": {
+            "type": "ref",
+            "content": [
+              "write",
+              "result"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "start",
+      "to": "write"
+    },
+    {
+      "from": "write",
+      "to": "end"
+    }
+  ]
+}

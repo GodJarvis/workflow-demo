@@ -15,8 +15,18 @@ return [
 
     // 任务/节点执行的超时(秒):节点级 wall-clock,docker kill 兜底
     'node_timeout' => 60,
-    // 工作流整体超时(秒)
-    'workflow_timeout' => 300,
+    // 工作流整体超时(秒):HTTP 入口的 Channel 等待上限。
+    // 含长耗时节点(如视频生成 mockSeconds=8 / 真实生成数分钟)的工作流需要足够大;-1 = 不限
+    'workflow_timeout' => 600,
+
+    // LLM 节点全局默认(OpenAI 兼容协议;节点 data 可逐项覆盖)
+    'llm' => [
+        'base_url' => '',              // 例:https://api.openai.com/v1 或内部网关;留空走 mock
+        'api_key'  => '',              // 留空走 mock
+        'model'    => 'gpt-4o-mini',
+        'timeout'  => 120,             // 长响应兜底
+        'mock'     => true,            // 教学默认:无 key 返回模拟文本;配好 key 后置 false
+    ],
 
     // 引擎容器内路径前缀 => 宿主机路径前缀(供 docker run 挂载换算)
     'path_map' => [
