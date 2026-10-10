@@ -23,11 +23,13 @@ return [
         '/var/project/workflow-demo' => '/home/zw/www/workflow-demo',
     ],
 
-    // 多语言沙箱镜像映射:language => 镜像名(docker 档使用)
+    // 多语言沙箱镜像映射:language => 镜像名(docker 档使用,五语言全覆盖)
     'sandbox_images' => [
         'python'      => 'wf-sandbox-python:demo',
         'javascript'  => 'wf-sandbox-node:demo',
         'php'         => 'wf-sandbox-php:demo',
+        'golang'      => 'wf-sandbox-golang:demo',   // 编译型:go run 双文件壳 + GOCACHE 跨执行缓存
+        'java'        => 'wf-sandbox-java:demo',     // 编译型:JEP 330 单文件源码 + gson 预置
     ],
 
     // ★ 沙箱档位(教学三档体系):
@@ -60,10 +62,11 @@ return [
 
     // 沙箱资源限额(docker 档 docker run 参数化)
     'sandbox' => [
-        'memory'          => '256m',  // cgroup 内存上限,超限 OOM-kill(退出码 137)
+        'memory'          => '256m',  // cgroup 内存上限,超限 OOM-kill(退出码 137);java 档自动抬到 512m
         'cpus'            => '0.5',   // CPU 配额
-        'pids_limit'      => '64',    // 防 fork 炸弹
-        'timeout'         => 30,      // 沙箱进程 wall-clock 超时(秒),超时 docker kill(退出码 124)
+        'pids_limit'      => '64',    // 防 fork 炸弹(golang 并行编译由 GOMAXPROCS=2 配合)
+        'timeout'         => 30,      // 解释型 wall-clock 超时(秒)
+        'compiled_timeout'=> 60,      // 编译型(golang/java)超时:含编译时间,首跑 3-10s
         'enable_seccomp'  => true,    // syscall 白名单;调试时可关闭
         'seccomp_profile' => '/docker/seccomp-profile.json',  // 相对 BASE_PATH
         // 环境变量白名单(借鉴 dify-sandbox conf.allowed_env_vars):

@@ -27,11 +27,13 @@ use Hyperf\Contract\ConfigInterface;
  */
 class CodeExecutor implements NodeExecutorInterface
 {
-    /** 语言 → 代码文件名(文件协议约定,两档沙箱共用) */
+    /** 语言 → 代码文件名(文件协议约定,docker 档全部支持;process/dify 档见各自 Driver 的语言范围) */
     private const FILE_NAMES = [
         'python' => 'code.py',
         'javascript' => 'code.js',
         'php' => 'code.php',
+        'golang' => 'code.go',      // 编译型:完整合法 Go 文件,定义 Main(见 docker/runners/wire.go)
+        'java' => 'code.java',      // 编译型:顶层 User 类声明,无 import(见 docker/runners/Main.java)
     ];
 
     private string $runsDir;
@@ -70,6 +72,18 @@ class CodeExecutor implements NodeExecutorInterface
             mkdir($taskDir, 0777, true);
         }
         $fileName = self::FILE_NAMES[$language];
+        // Java:引擎侧预拼接(壳模板 + 用户代码)—— JEP 330 单文件模式只能一个文件,
+        // 且沙箱内不经 sh/cat(绕开 busybox 兼容问题);dify 官方同样是 api 侧拼好整段代码下发
+        if ($language === 'java') {
+            $shellTemplate = (string) file_get_contents(BASE_PATH . '/docker/runners/Main.java');
+            $content = $shellTemplate . "\n" . $content . "\n";
+        }
+        // Golang:双文件壳 —— go run 要求所有源文件同目录,壳(wire.go)由引擎一并落进任务目录
+        if ($language === 'golang') {
+            $wire = (string) file_get_contents(BASE_PATH . '/docker/runners/wire.go');
+            file_put_contents($taskDir . '/wire.go', $wire);
+            chmod($taskDir . '/wire.go', 0666);
+        }
         file_put_contents($taskDir . '/' . $fileName, $content);
         file_put_contents($taskDir . '/input.json', json_encode(['params' => $inputs], JSON_UNESCAPED_UNICODE));
         // 沙箱内以低权限用户执行(docker 档 nobody / process 档池化 UID),需放开读写权限

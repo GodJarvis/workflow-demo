@@ -28,7 +28,12 @@ class DockerSandboxDriver implements SandboxDriverInterface
         'python' => 'code.py',
         'javascript' => 'code.js',
         'php' => 'code.php',
+        'golang' => 'code.go',
+        'java' => 'code.java',
     ];
+
+    /** 编译型语言:需要更宽的超时(编译)与更大的 tmpfs(编译中间产物) */
+    private const COMPILED_LANGUAGES = ['golang', 'java'];
 
     /** @var array<string, string> */
     private array $pathMap;
@@ -57,7 +62,7 @@ class DockerSandboxDriver implements SandboxDriverInterface
         $fileName = self::FILE_NAMES[$language];
         $containerName = 'wf_' . uniqid('sandbox_');
 
-        $containerId = $this->createContainer($containerName, $taskDir, $image, $fileName);
+        $containerId = $this->createContainer($containerName, $taskDir, $image, $fileName, $language);
         if ($containerId === null) {
             return ['exitCode' => 125, 'stdout' => '', 'stderr' => 'docker create failed'];
         }
@@ -69,11 +74,15 @@ class DockerSandboxDriver implements SandboxDriverInterface
             return ['exitCode' => 125, 'stdout' => '', 'stderr' => 'docker start failed: ' . $message];
         }
 
-        // 阻塞等待退出;curl --max-time 兜底 wall-clock 超时
-        $timeout = (int) ($this->sandboxConfig['timeout'] ?? 30);
+        // 阻塞等待退出;curl --max-time 兜底 wall-clock 超时(编译型语言放宽)
+        $timeout = $this->languageTimeout($language);
+        // condition 用 not-running 而非 next-except 的关键区别:
+        // next-exit 等"下一次退出"——若调用时容器已退出(快速任务的竞态,HTTP 环境下
+        // start→wait 的调度间隔 > 容器寿命)会永远不返回,直至超时;not-running 对
+        // "已退出/退出中" 均立即返回,语义即"等到不再运行"
         [$waitOk, $waitBody] = $this->dockerRequest(
             'POST',
-            "/containers/{$containerId}/wait?condition=next-exit",
+            "/containers/{$containerId}/wait?condition=not-running",
             timeout: $timeout,
         );
 
@@ -116,15 +125,40 @@ class DockerSandboxDriver implements SandboxDriverInterface
     /**
      * 创建一次性沙箱容器:全部隔离参数在 HostConfig 声明
      */
-    private function createContainer(string $name, string $taskDir, string $image, string $fileName): ?string
+    private function createContainer(string $name, string $taskDir, string $image, string $fileName, string $language): ?string
     {
         $memory = $this->parseMemoryLimit((string) ($this->sandboxConfig['memory'] ?? '256m'));
         $cpus = (float) ($this->sandboxConfig['cpus'] ?? 0.5);
+        $isCompiled = in_array($language, self::COMPILED_LANGUAGES, true);
+        // 编译型语言放宽 wall-clock 超时与 tmpfs(编译中间产物),内存给 JVM 编译留余量
+        $timeout = $isCompiled
+            ? (int) ($this->sandboxConfig['compiled_timeout'] ?? 60)
+            : (int) ($this->sandboxConfig['timeout'] ?? 30);
+        $tmpfsSize = $isCompiled ? 'size=256m' : 'size=16m';
+        if ($language === 'java') {
+            $memory = max($memory, 512 * 1024 * 1024);   // JVM 编译单文件源码的堆下限
+        }
+
+        $binds = [$this->toHostPath($taskDir) . ':/task'];
+        // Golang:GOCACHE 挂宿主目录,跨执行复用编译缓存(编译型语言的缓存管道,第二次起 ~1s)
+        if ($language === 'golang') {
+            $goCacheDir = $this->toHostPath(BASE_PATH . '/.gocache');
+            if (! is_dir($goCacheDir)) {
+                mkdir($goCacheDir, 0777, true);
+            }
+            chmod($goCacheDir, 0777);
+            $binds[] = $goCacheDir . ':/gocache';
+        }
+
+        // tmpfs 必须带 exec:go 工具链把编译产物放在 /tmp 下并直接执行(默认选项为 noexec → EACCES)
+        $tmpfsMode = $language === 'golang' ? 'rw,exec,size=256m' : 'rw,' . $tmpfsSize;
 
         $payload = [
             'Image' => $image,
-            // 镜像 ENTRYPOINT 已内置 runner,此处仅传文件协议三件套
-            'Cmd' => ["/task/{$fileName}", '/task/input.json', '/task/output.json'],
+            // 解释型语言:传文件协议三件套(镜像 ENTRYPOINT 为 runner);
+            // 编译型语言:ENTRYPOINT 已写死完整命令,不传 Cmd(docker 会把 Cmd 追加到
+            // ENTRYPOINT 之后,go run 会把追加的 .go 文件当重复源文件编译)
+            'Cmd' => $isCompiled ? [] : ["/task/{$fileName}", '/task/input.json', '/task/output.json'],
             'User' => '65534:65534', // nobody 非 root
             'Env' => $this->buildEnv(),
             'WorkingDir' => '/task',
@@ -138,8 +172,8 @@ class DockerSandboxDriver implements SandboxDriverInterface
                 'ReadonlyRootfs' => true,
                 'CapDrop' => ['ALL'],
                 'SecurityOpt' => array_merge(['no-new-privileges'], $this->seccompOption()),
-                'Tmpfs' => ['/tmp' => 'rw,size=16m'],
-                'Binds' => [$this->toHostPath($taskDir) . ':/task'],
+                'Tmpfs' => ['/tmp' => $tmpfsMode],
+                'Binds' => $binds,
                 'AutoRemove' => false,
             ],
         ];
@@ -157,13 +191,29 @@ class DockerSandboxDriver implements SandboxDriverInterface
     }
 
     /**
+     * 按语言取 wall-clock 超时:解释型 30s;编译型(含编译时间)放宽到 60s
+     */
+    private function languageTimeout(string $language): int
+    {
+        if (in_array($language, self::COMPILED_LANGUAGES, true)) {
+            return (int) ($this->sandboxConfig['compiled_timeout'] ?? 60);
+        }
+        return (int) ($this->sandboxConfig['timeout'] ?? 30);
+    }
+
+    /**
      * 环境变量白名单透传(对应容器镜像默认只带 LANG;借鉴 dify allowed_env_vars)
+     * 注意:PATH 必须跳过 —— 显式 Env 会覆盖镜像自身的 ENV PATH,
+     * 而 golang 等工具链装在 /usr/local/go/bin(非系统默认路径),覆盖后找不到解释器
      * @return string[]
      */
     private function buildEnv(): array
     {
         $env = [];
         foreach ($this->allowedEnvVars as $name) {
+            if ($name === 'PATH') {
+                continue; // 镜像 ENV PATH 更权威(含工具链路径)
+            }
             $value = getenv($name);
             if ($value !== false && $value !== '') {
                 $env[] = "{$name}={$value}";

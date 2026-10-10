@@ -4,3 +4,4 @@ runtime/
 .runs/
 *.log
 .DS_Store
+.gocache/

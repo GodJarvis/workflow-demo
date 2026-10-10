@@ -1,0 +1,281 @@
+{
+  "id": "all-languages",
+  "comment": "五语言流水线(教学):start → python清洗 → js加工 → golang分类(编译型) → php格式化 → java汇总(编译型) → end。每节点沿 ref 链传递加工数据;golang/java 演示编译型语言的 Main 协议与 GOCACHE 缓存管道。",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "data": {
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "clean",
+      "type": "code",
+      "data": {
+        "title": "Python 清洗",
+        "script": {
+          "language": "python",
+          "content": "import json, sys\n\ndef main(params):\n    text = str(params.get('text', '')).strip()\n    print(json.dumps({'level': 'log', 'msg': '[py] cleaned: ' + text}), file=sys.stderr)\n    return {'cleaned': text, 'length': len(text)}\n"
+        },
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            }
+          }
+        },
+        "inputsValues": {
+          "text": {
+            "type": "ref",
+            "content": [
+              "start",
+              "query"
+            ]
+          }
+        },
+        "outputsSchema": {
+          "type": "object",
+          "properties": {
+            "cleaned": {
+              "type": "string"
+            },
+            "length": {
+              "type": "number"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "enrich",
+      "type": "code",
+      "data": {
+        "title": "JavaScript 加工",
+        "script": {
+          "language": "javascript",
+          "content": "/** 加工:补全上下文标签 */\nasync function main({ params }) {\n  const t = String(params.text || '');\n  console.error(JSON.stringify({ level: 'log', msg: '[js] enriched' }));\n  return { enriched: '[' + t + '] via polyglot pipeline' };\n}\n"
+        },
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            }
+          }
+        },
+        "inputsValues": {
+          "text": {
+            "type": "ref",
+            "content": [
+              "clean",
+              "cleaned"
+            ]
+          }
+        },
+        "outputsSchema": {
+          "type": "object",
+          "properties": {
+            "enriched": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "classify",
+      "type": "code",
+      "data": {
+        "title": "Golang 分类(编译型)",
+        "sandboxDriver": "docker",
+        "script": {
+          "language": "golang",
+          "content": "package main\n\nimport \"fmt\"\n\n// Go 用户代码约定:完整合法文件,定义导出的 Main(与 wire.go 同 package 链接)\nfunc Main(params map[string]any) (map[string]any, error) {\n\ttext := fmt.Sprintf(\"%v\", params[\"enriched\"])\n\tkind := \"short\"\n\tif len(text) > 20 {\n\t\tkind = \"long\"\n\t}\n\treturn map[string]any{\"kind\": kind, \"length\": len(text)}, nil\n}\n"
+        },
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "enriched": {
+              "type": "string"
+            }
+          }
+        },
+        "inputsValues": {
+          "enriched": {
+            "type": "ref",
+            "content": [
+              "enrich",
+              "enriched"
+            ]
+          }
+        },
+        "outputsSchema": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "length": {
+              "type": "number"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "format",
+      "type": "code",
+      "data": {
+        "title": "PHP 格式化",
+        "script": {
+          "language": "php",
+          "content": "<?php\n// PHP 用户代码约定:function main(array $params): array\nfunction main(array $params): array\n{\n    $kind = (string) ($params['kind'] ?? 'unknown');\n    fwrite(STDERR, json_encode(['level' => 'log', 'msg' => '[php] kind=' . $kind], JSON_UNESCAPED_UNICODE) . \"\\n\");\n    return ['summary' => sprintf('分类结果「%s」', $kind)];\n}\n"
+        },
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string"
+            }
+          }
+        },
+        "inputsValues": {
+          "kind": {
+            "type": "ref",
+            "content": [
+              "classify",
+              "kind"
+            ]
+          }
+        },
+        "outputsSchema": {
+          "type": "object",
+          "properties": {
+            "summary": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "summarize",
+      "type": "code",
+      "data": {
+        "title": "Java 汇总(编译型)",
+        "sandboxDriver": "docker",
+        "script": {
+          "language": "java",
+          "content": "// Java 用户代码约定:顶层 User 类,无 import(壳已预置 java.util/gson)\nclass User {\n    public static Map<String, Object> main(Map<String, Object> params) {\n        String summary = String.valueOf(params.get(\"summary\"));\n        Map<String, Object> out = new HashMap<>();\n        out.put(\"report\", \"[java] \" + summary + \" — polyglot ok\");\n        out.put(\"chars\", summary.length());\n        System.err.println(\"{\\\"level\\\":\\\"log\\\",\\\"msg\\\":\\\"[java] summarized\\\"}\");\n        return out;\n    }\n}\n"
+        },
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "summary": {
+              "type": "string"
+            }
+          }
+        },
+        "inputsValues": {
+          "summary": {
+            "type": "ref",
+            "content": [
+              "format",
+              "summary"
+            ]
+          }
+        },
+        "outputsSchema": {
+          "type": "object",
+          "properties": {
+            "report": {
+              "type": "string"
+            },
+            "chars": {
+              "type": "number"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "end",
+      "type": "end",
+      "data": {
+        "title": "结束(汇聚)",
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "report": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "length": {
+              "type": "number"
+            }
+          }
+        },
+        "inputsValues": {
+          "report": {
+            "type": "ref",
+            "content": [
+              "summarize",
+              "report"
+            ]
+          },
+          "kind": {
+            "type": "ref",
+            "content": [
+              "classify",
+              "kind"
+            ]
+          },
+          "length": {
+            "type": "ref",
+            "content": [
+              "classify",
+              "length"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "start",
+      "to": "clean"
+    },
+    {
+      "from": "clean",
+      "to": "enrich"
+    },
+    {
+      "from": "enrich",
+      "to": "classify"
+    },
+    {
+      "from": "classify",
+      "to": "format"
+    },
+    {
+      "from": "format",
+      "to": "summarize"
+    },
+    {
+      "from": "summarize",
+      "to": "end"
+    }
+  ]
+}

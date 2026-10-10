@@ -53,10 +53,36 @@ HTTP :9501 ─────────┘        │                    │
 | 调用方式 | 本容器 `Coroutine::exec` 子进程 | HTTP `POST /v1/sandbox/run`(host-gateway) | Docker Engine API(curl + unix socket) |
 | 网络 | ❌ 无法禁网 | 服务侧 seccomp 开关 + 代理 | ✅ `NetworkMode: none` 硬禁 |
 | 文件系统 | 一次性私有工作目录 | dify 服务内部临时目录 | 只读 rootfs + tmpfs + 挂载 /task |
-| 语言 | python/js/php | **python/js(上游无 php)** | python/js/php |
+| 语言 | py/js/php | py/js(dify 上游仅此) | **五语言** py/js/php/golang/java |
 | 冷启动(实测) | ~35-70ms | **~23-30ms** ⚡ | ~130-250ms |
 | 部署形态 | 引擎同进程 | 独立 Go 服务(生产 sandbox-manager 形态) | 引擎经 daemon 拉起 |
 | 适用 | 内部可信/高频 | 服务化解耦/独立扩缩容 | 开放多租户 |
+
+#### 语言支持矩阵(五语言)
+
+| 语言 | process 档 | docker 档 | dify 档 |
+|---|:---:|:---:|:---:|
+| Python(`def main(params) -> dict`) | ✅ | ✅ | ✅(API 语言名 `python3`) |
+| JavaScript(`async function main({params})`) | ✅ | ✅ | ✅(API 语言名 `nodejs`,CJS 语义,无顶层 await) |
+| PHP(`function main(array $params): array`) | ✅ | ✅ | ❌ 上游无此 runner |
+| Golang(`func Main(params) (map[string]any, error)`) | ❌ | ✅ **编译型** | ❌ |
+| Java(`class User { static Map main(Map) }`) | ❌ | ✅ **编译型** | ❌ |
+
+**编译型语言(Go/Java)只走 docker 档**——工具链体积不适合进程级镜像、dify 上游无 runner。两个实测方案(均为全隔离参数下跑通):
+
+| | Golang | Java |
+|---|---|---|
+| 执行方式 | `go run wire.go code.go` **双文件壳**(同 package 链接,import 互不冲突) | **引擎侧预拼接**(壳模板 Main.java + 用户 User 类)后 JEP 330 单文件源码模式 |
+| 用户代码形态 | 完整合法 Go 文件(自带 package/import,定义导出 `Main`) | 顶层 `class User` 声明,**无 import**(壳预置 java.util/gson) |
+| 跨执行缓存 | ✅ GOCACHE 挂宿主 `.gocache/`:冷编译 ~12.8s → 热 **~0.2-0.3s** | JEP 330 每次内存编译 ~1.8s(生产可换 javac 产物缓存/AppCDS) |
+| 超时 | 60s(`compiled_timeout`,含编译) | 60s |
+| 特殊参数 | tmpfs 需 `exec`(编译产物在 /tmp 执行)、GOMAXPROCS=2(防撞 pids-limit) | 内存抬到 512m、SerialGC |
+
+**dify 档语言限制的来源**:`dify-sandbox` 的 `internal/controller/run.go` 只分发 `python3` / `nodejs` 两个 case(其余 400 unsupported),配套也只有 `runner/{python,nodejs}/` 两套 runner、`python_path`/`nodejs_path` 两个解释器配置、`static/{python_syscall,nodejs_syscall}` 两份 syscall 白名单——上游产品侧代码节点本就只暴露双语言。DifySandboxDriver 对 php 节点显式抛错并引导换档,而非静默失败。
+
+**实践建议**:工作流含 php 节点时用节点级档位覆盖——python/js 节点选 `dify`(最快),php 节点指定 `data.sandboxDriver: "docker"` 或 `"process"`(`examples/mixed-sandboxes.json` 即此布局)。
+
+**扩展指引**(暂不实现):若要 dify 档支持 php,需在上游仿照 nodejs 增加完整一套——`internal/core/runner/php/` runner + `static/php_syscall/` 白名单 + `cmd/lib/php/` 的 c-shared seccomp 锁库(php 版 prescript),工作量约等于移植半个 nodejs 分支;当前阶段用三档混合调度绕过即可。
 
 **切换方式**:全局 `config/autoload/workflow.php → 'sandbox_driver'`;节点级 `data.sandboxDriver`(见 `examples/mixed-sandboxes.json`:python=dify / js=docker / php=process,一图三档对比)。
 
@@ -90,6 +116,13 @@ HTTP :9501 ─────────┘        │                    │
 2. **`mkdir(0777)` 被 umask 削成 0755**:必须显式 `chmod`,否则降权 UID 写不了 output.json
 3. **Swoole worker 改名导致 pkill 失效**:旧 server 僵尸持端口,新 server "Address in use" 静默失败,测试全打到旧代码——排查性能问题第一步永远是确认"测的是新代码"
 4. **Symfony Process 的 1ms 轮询在 hyperf EventLoop 里被放大到 ~200ms**:process 档改用 `Coroutine::exec`(协程挂起等待,不轮询)
+5. **busybox sh 在 seccomp 下的未解之谜**:ENTRYPOINT 经 `sh -c "cat a b > /tmp/x"` 在白名单 profile 下 255 秒退,而 LOG 放行/strace 观测的 syscall 全集均 ⊆ 白名单 → 规避:**编译型语言在引擎侧预拼接**(dify 官方同款:api 侧拼好整段代码),沙箱内不再出现 sh/cat
+6. **seccomp 白名单的编译型补课**(每条都是真实报错):`execve`(容器入口)、`clone/clone3`(V8/pthread)、`fork/vfork`(musl 的 fork 走 SYS_fork)、`wait4/waitid`(go 工具链收割子进程)、`mkdir 族`(go 建 work dir)、`flock`(go 缓存锁)、`sendfile/copy_file_range`(coreutils fast path)、`capget/capset + setgroups/setuid 族`(runc init,与 dify 白名单同款)、`getpgrp/getsid 族`(shell job control)
+7. **tmpfs 默认 noexec**:go 把编译产物放 /tmp 并直接执行 → EACCES,tmpfs 须加 `exec` 选项
+8. **显式 Env 覆盖镜像 ENV PATH**:golang 在 /usr/local/go/bin,透传 PATH 白名单变量反而让 `go` 找不到——docker 档的 env 白名单必须跳过 PATH
+9. **go run 要求所有源文件同目录**:wire.go 必须与 code.go 一起落在 /task(引擎侧下发),跨目录双文件直接报错
+10. **GOCACHE 属主是容器内 nobody**:宿主清理需 sudo;生产应规划缓存目录 UID 或专用卷
+11. **Docker wait 的 next-exit 竞态**:秒级任务在 HTTP 常驻进程下偶发 30s 超时——容器已退出后调 `next-exit` 会永等"下一次退出";改用 `not-running`(电平语义,已退出立即返回)
 
 ## 快速开始
 
@@ -98,12 +131,16 @@ HTTP :9501 ─────────┘        │                    │
 docker compose up -d wf-engine
 docker exec wf-engine sh -c "cd /var/project/workflow-demo && composer install"
 
-# 2. 构建三个语言沙箱镜像
-docker compose build wf-sandbox-python wf-sandbox-node wf-sandbox-php
+# 2. 构建全部语言沙箱镜像(五语言;编译型 golang/java 亦在此列)
+docker compose build wf-sandbox-python wf-sandbox-node wf-sandbox-php wf-sandbox-golang wf-sandbox-java
 
 # 3. CLI 跑示例流(长文本 → JS 打分分支)
 docker exec wf-engine sh -c "cd /var/project/workflow-demo && \
   php bin/hyperf.php workflow run examples/first-flow.json --inputs='{\"query\":\"  hello workflow engine demo  \"}'"
+
+# 五语言流水线:python → js → golang → php → java 串行加工(编译型走 docker 档)
+docker exec wf-engine sh -c "cd /var/project/workflow-demo && \
+  php bin/hyperf.php workflow run examples/all-languages.json --inputs='{\"query\":\"  hello polyglot workflow  \"}'"
 
 # 短文本 → PHP 兜底分支(JS 节点被裁剪为 skipped)
 docker exec wf-engine sh -c "cd /var/project/workflow-demo && \
@@ -167,7 +204,10 @@ app/Workflow/
 ├── Task/TaskStore.php                    # 任务状态机(JSON 文件存储)
 └── Variable/VariableStore.php            # Map<nodeID, Map<key, Variable>>
 docker/
-├── runners/{runner.py,runner.mjs,runner.php}   # 三语言统一 Runner(文件协议)
+├── runners/                                 # 五语言统一 Runner(文件协议)
+│   ├── {runner.py,runner.mjs,runner.php}    # 解释型:镜像内置,加载用户代码调 main()
+│   ├── wire.go                              # 编译型(Go):双文件壳,与用户 code.go 同 package 编译
+│   └── Main.java                            # 编译型(Java):壳模板,引擎预拼接后 JEP330 执行
 ├── sandbox-{python,node,php}/Dockerfile        # 轻量沙箱镜像(ENTRYPOINT 内置 runner)
 └── seccomp-profile.json                         # syscall 白名单
 ```

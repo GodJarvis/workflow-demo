@@ -20,7 +20,10 @@
         "pread64", "pwrite64", "readv", "writev", "getdents64", "getdents",
         "access", "faccessat", "faccessat2", "fcntl", "dup", "dup2", "dup3",
         "pipe", "pipe2", "ftruncate", "memfd_create", "fstatfs", "statfs", "fsync", "fdatasync",
-        "execve", "execveat"
+        "execve", "execveat", "sendfile", "copy_file_range", "splice",
+        "mkdir", "mkdirat", "rmdir", "unlink", "unlinkat",
+        "rename", "renameat", "renameat2", "link", "linkat", "symlink", "symlinkat",
+        "flock", "fcntl64"
       ],
       "action": "SCMP_ACT_ALLOW"
     },
@@ -36,10 +39,10 @@
         "brk", "arch_prctl", "set_tid_address", "set_robust_list", "get_robust_list",
         "rseq", "futex", "sched_getaffinity", "sched_yield", "uname", "sysinfo",
         "prlimit64", "getrlimit", "getrusage",
-        "clone", "clone3"
+        "clone", "clone3", "fork", "vfork", "wait4", "waitid"
       ],
       "action": "SCMP_ACT_ALLOW",
-      "comment": "clone/clone3:pthread/V8 平台线程创建必需;进程爆炸由 pids-limit + 非 root 双重兜底(seccomp 无法按 flags 区分线程/进程)"
+      "comment": "clone/clone3:pthread/V8 平台线程创建必需;fork/vfork:musl(Alpine)的 fork() 直接走 SYS_fork(busybox sh/JVM 均需要);wait4/waitid:进程等待(Go 工具链用 waitid 收割编译子进程)。进程爆炸由 pids-limit + 非 root 双重兜底(seccomp 无法按 flags 区分线程/进程)"
     },
     {
       "names": [
@@ -58,9 +61,15 @@
     },
     {
       "names": [
-        "getpid", "getppid", "gettid", "getuid", "geteuid", "getgid", "getegid", "ioctl"
+        "getpid", "getppid", "gettid", "getuid", "geteuid", "getgid", "getegid", "ioctl",
+        "capget", "capset",
+        "setgroups", "setuid", "setgid", "setresuid", "setresgid",
+        "getgroups", "getpgrp", "getpgid", "getsid", "setpgid", "setsid",
+        "rt_sigpending", "rt_sigtimedwait",
+        "preadv2", "pwritev2", "pselect6"
       ],
-      "action": "SCMP_ACT_ALLOW"
+      "action": "SCMP_ACT_ALLOW",
+      "comment": "capget/capset:runc 容器 init 阶段的能力版本探测(新版 runc);setgroups/setuid/setgid 族:runc setup user 需要(与 dify 白名单同款);getpgrp/getsid 族:shell(bash/busybox)job control 初始化需要;均低风险(配合 no-new-privileges + cap-drop ALL)"
     },
     {
       "names": [

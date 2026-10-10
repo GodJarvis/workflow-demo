@@ -41,3 +41,16 @@ services:
       context: ./docker
       dockerfile: sandbox-php/Dockerfile
     image: wf-sandbox-php:demo
+
+  # 编译型语言沙箱(仅 docker 档支持;process 档装不起工具链、dify 上游无此 runner)
+  wf-sandbox-golang:
+    build:
+      context: ./docker
+      dockerfile: sandbox-golang/Dockerfile
+    image: wf-sandbox-golang:demo
+
+  wf-sandbox-java:
+    build:
+      context: ./docker
+      dockerfile: sandbox-java/Dockerfile
+    image: wf-sandbox-java:demo

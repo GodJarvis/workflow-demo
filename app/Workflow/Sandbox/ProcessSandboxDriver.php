@@ -77,7 +77,10 @@ class ProcessSandboxDriver implements SandboxDriverInterface
     public function run(string $taskDir, string $language): array
     {
         $interpreter = self::INTERPRETERS[$language]
-            ?? throw new \RuntimeException("Process sandbox: unsupported language '{$language}'");
+            ?? throw new \RuntimeException(
+                "Process sandbox: language '{$language}' not supported (interpreters only: python/js/php; "
+                . '编译型 golang/java 请使用 docker 档 —— 工具链体积/编译缓存不适合进程级)',
+            );
         $fileName = self::FILE_NAMES[$language];
         $timeout = (int) ($this->processConfig['timeout'] ?? 15);
 
