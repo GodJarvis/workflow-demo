@@ -7,7 +7,12 @@ namespace App\Workflow\Engine\Executors;
 use App\Workflow\Context\WorkflowContext;
 use App\Workflow\Document\NodeModel;
 use App\Workflow\Engine\NodeExecutorInterface;
+use App\Workflow\Engine\Waiter\WaiterRegistryFactory;
+use App\Workflow\Task\TaskStore;
+use Hyperf\Context\ApplicationContext;
+use Hyperf\Contract\ConfigInterface;
 use Swoole\Coroutine;
+use Swoole\Coroutine\Channel;
 
 /**
  * 视频生成节点:长耗时异步任务的引擎范型(教学重点)
@@ -59,6 +64,14 @@ class VideoExecutor implements NodeExecutorInterface
         }
         $data = $node->data;
 
+        // ── asyncCallback 模式:回调闭环范型(不再轮询,挂起等唤醒)──
+        // 提交外部任务 → 双注册(进程内等待者索引 + 持久化回调索引)→ Channel 挂起;
+        // 外部完成回调 POST /workflow/callback:落库 → 快路径 push 本协程续跑 /
+        // 等待者已死(重启/跨进程)→ 慢路径 checkpoint 重载推进。详见教学手册 03§7。
+        if (! empty($data['asyncCallback'])) {
+            return $this->waitForCallback($context, $node, $prompt);
+        }
+
         // ── mock 模式:挂起模拟生成(验证协程异步语义)──
         if (empty($data['submitUrl'])) {
             $seconds = (int) ($data['mockSeconds'] ?? 8);
@@ -105,7 +118,72 @@ class VideoExecutor implements NodeExecutorInterface
         }
     }
 
-    /** @return array<string, mixed> */
+    /**
+     * 回调等待:双注册 + Channel 挂起 + waiting-callback.json 提示文件(用户从这里拿 taskId)
+     *
+     * @return array{outputs: array<string, mixed>, logs: array}
+     */
+    private function waitForCallback(WorkflowContext $context, NodeModel $node, string $prompt): array
+    {
+        $config = ApplicationContext::getContainer()->get(ConfigInterface::class);
+        $runsDir = (string) $config->get('workflow.runs_dir', BASE_PATH . '/.runs');
+        $tasks = new TaskStore($runsDir);
+
+        $timeout = (int) ($node->data['callbackTimeout'] ?? 120);
+        $taskId = 'vid_cb_' . bin2hex(random_bytes(4));
+
+        // ① 双注册:本地/跨进程等待者(按 config 选 Registry 实现)+ 持久化 taskId→node 索引(慢路径定位凭据)
+        $registry = WaiterRegistryFactory::make();
+        $channel = new Channel(1);
+        $registry->register($taskId, $channel, $context->taskID, $node->id);
+        $tasks->indexCallback($taskId, $context->taskID, $node->id);
+
+        // ② waiting 提示文件:与文件协议同目录,CLI/用户 cat 此文件拿 taskId 发回调
+        //    (video 节点不经 CodeExecutor,任务目录需自建)
+        $nodeDir = rtrim($runsDir, '/') . "/{$context->taskID}/nodes/{$node->id}";
+        if (! is_dir($nodeDir)) {
+            mkdir($nodeDir, 0777, true);
+        }
+        $waitingFile = $nodeDir . '/waiting-callback.json';
+        file_put_contents($waitingFile, json_encode([
+            'taskId' => $taskId,
+            'nodeID' => $node->id,
+            'status' => 'waiting_external_callback',
+            'hint' => 'curl -X POST :9501/workflow/callback -H "X-Callback-Token: <token>" -d \'{"taskId":"' . $taskId . '","outputs":{"videoUrl":"https://example.com/v.mp4","taskId":"' . $taskId . '"}}\'',
+            'createdAt' => microtime(true),
+        ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
+
+        // ③ 节点状态 waiting + 挂起等待唤醒(等待者:本协程)
+        $context->nodeStatuses[$node->id] = 'waiting';
+
+        try {
+            $result = $channel->pop($timeout);   // ★挂起:本进程被投递唤醒即毫秒级续跑;无人投递则超时兜底
+        } finally {
+            $registry->remove($taskId);
+            @unlink($waitingFile);
+        }
+
+        if ($result === false) {
+            // 超时 = 快路径无人唤醒(可能等待者被重启/回调打到了别的进程但慢路径已推进)
+            // 幂等防重:若回调事实已存在且节点已被慢路径完成,这里抛错即可(report 可查真实状态)
+            throw new \RuntimeException("Video node '{$node->id}': callback wait timeout after {$timeout}s (taskId={$taskId}; 若慢路径已推进,请以 workflow report 为准)");
+        }
+
+        $outputs = is_array($result) ? $result : ['result' => $result];
+        $outputs['taskId'] = $outputs['taskId'] ?? $taskId;
+
+        return [
+            'outputs' => $outputs,
+            'logs' => [[
+                'level' => 'log',
+                'msg' => "video task {$taskId} completed via callback: " . ($outputs['videoUrl'] ?? '(no url)'),
+            ]],
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
     private function submit(string $url, string $prompt, int $timeout): string
     {
         $decoded = $this->http($url, true, json_encode(['prompt' => $prompt], JSON_UNESCAPED_UNICODE), $timeout);

@@ -13,3 +13,5 @@ Router::post('/workflow/report', [WorkflowController::class, 'report']);
 Router::post('/workflow/validate', [WorkflowController::class, 'validate']);
 // 从最后 checkpoint 恢复执行中断的任务(演示可序列化 Context)
 Router::post('/workflow/resume', [WorkflowController::class, 'resume']);
+// 外部系统完成事件回调(异步节点闭环:X-Callback-Token 鉴权,落库+双路径推进)
+Router::post('/workflow/callback', [WorkflowController::class, 'callback']);

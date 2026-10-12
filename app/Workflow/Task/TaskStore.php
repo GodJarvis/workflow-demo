@@ -84,6 +84,65 @@ class TaskStore
         file_put_contents($this->checkpointFile($taskID), json_encode($serializedContext, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
     }
 
+    // ------------------------------------------------- 外部回调索引与事实(JSON 文件;生产替换点:Redis Hash / DB)
+
+    /**
+     * 全局回调索引:taskId → {taskID, nodeID, createdAt}
+     * 回调端点只有 taskId,靠它定位工作流(demo 用单文件;生产 Redis Hash,替换点仅此一组方法)
+     * @return array<string, array{taskID: string, nodeID: string, createdAt: float}>
+     */
+    public function loadCallbackIndex(): array
+    {
+        $file = rtrim($this->runsDir, '/') . '/callback-index.json';
+        if (! is_file($file)) {
+            return [];
+        }
+        return json_decode((string) file_get_contents($file), true) ?: [];
+    }
+
+    public function saveCallbackIndex(array $index): void
+    {
+        file_put_contents(rtrim($this->runsDir, '/') . '/callback-index.json', json_encode($index, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
+    }
+
+    public function indexCallback(string $taskId, string $taskID, string $nodeID): void
+    {
+        $index = $this->loadCallbackIndex();
+        $index[$taskId] = ['taskID' => $taskID, 'nodeID' => $nodeID, 'createdAt' => microtime(true)];
+        $this->saveCallbackIndex($index);
+    }
+
+    public function unindexCallback(string $taskId): void
+    {
+        $index = $this->loadCallbackIndex();
+        unset($index[$taskId]);
+        $this->saveCallbackIndex($index);
+    }
+
+    /**
+     * 回调事实落库(黄金法则第一步:无论等待者死活,先持久化事实)
+     * 落库路径:.runs/<taskID>/callbacks/<taskId>.json(审计/幂等判断)
+     */
+    public function saveCallbackFact(string $taskID, string $taskId, array $payload): string
+    {
+        $dir = $this->taskDir($taskID) . '/callbacks';
+        if (! is_dir($dir)) {
+            mkdir($dir, 0777, true);
+        }
+        $file = $dir . '/' . $taskId . '.json';
+        $exists = is_file($file);
+        file_put_contents($file, json_encode(
+            ['taskId' => $taskId, 'receivedAt' => microtime(true)] + $payload,
+            JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT,
+        ));
+        return $exists ? 'duplicated' : 'stored';
+    }
+
+    public function hasCallbackFact(string $taskID, string $taskId): bool
+    {
+        return is_file($this->taskDir($taskID) . '/callbacks/' . $taskId . '.json');
+    }
+
     private function taskFile(string $taskID): string
     {
         return $this->taskDir($taskID) . '/task.json';

@@ -72,15 +72,32 @@ class Engine
         $this->tasks->update($context->taskID, ['status' => 'running']);
 
         try {
+            // 等待外部回调中的节点:不重跑(防外部任务重复提交),恢复后由回调端点推进
+            $waitingCallbacks = [];
+            foreach ($this->tasks->loadCallbackIndex() as $taskId => $entry) {
+                if (($entry['taskID'] ?? '') === $context->taskID) {
+                    $waitingCallbacks[$entry['nodeID'] ?? ''] = $taskId;
+                }
+            }
+
             $pending = [];
             foreach ($context->document->allNodes() as $node) {
                 if ($context->getState()->isExecutedNode($node)) {
                     continue;
                 }
+                if (isset($waitingCallbacks[$node->id])) {
+                    continue;   // 等待回调的节点跳过重跑,交给 completeExternalTask
+                }
                 if ($this->canExecuteNode($context, $node)) {
                     $pending[] = $node;
                 }
             }
+
+            if ($pending === [] && $waitingCallbacks !== []) {
+                // 无可跑节点且有等待回调者:保持 running,不误判 success
+                return;
+            }
+
             $wg = new WaitGroup();
             foreach ($pending as $node) {
                 $wg->add();
@@ -102,14 +119,69 @@ class Engine
             $context->status = 'failed';
             $context->error = $e->getMessage();
         } finally {
-            $context->endTime = microtime(true);
-            $this->tasks->update($context->taskID, [
-                'status' => $context->status,
-                'endTime' => $context->endTime,
-                'error' => $context->error,
-            ]);
-            $this->checkpoint($context);
+            if ($context->isTerminated()) {
+                $context->endTime = microtime(true);
+                $this->tasks->update($context->taskID, [
+                    'status' => $context->status,
+                    'endTime' => $context->endTime,
+                    'error' => $context->error,
+                ]);
+                $this->checkpoint($context);
+            }
         }
+    }
+
+    /**
+     * 慢路径:外部回调到来但等待者协程已死(进程重启/跨进程)——
+     * 从 checkpoint 重载 Context,补写 outputs 并推进后继(回调闭包的正确形态:
+     * 回调传 taskId 数据 + 固定 handler,而非传输行为)
+     *
+     * @param array<string, mixed> $outputs 回调携带的节点输出
+     * @return array<string, mixed> 推进结果摘要
+     */
+    public function completeExternalTask(string $taskID, string $nodeID, array $outputs): array
+    {
+        $task = $this->tasks->get($taskID) ?? throw new \RuntimeException("Task not found: {$taskID}");
+        $checkpoint = $this->tasks->loadCheckpoint($taskID) ?? throw new \RuntimeException("Task has no checkpoint: {$taskID}");
+        $document = Document::fromJsonFile(BASE_PATH . '/examples/' . $task['workflow'] . '.json');
+        $context = WorkflowContext::restore($checkpoint, $document);
+        $node = $document->getNode($nodeID) ?? throw new \RuntimeException("Node {$nodeID} not in workflow");
+
+        // 幂等:节点已完成(重复回调/快路径已完成后再收到)直接返回现状
+        if ($context->getState()->isExecutedNode($node)) {
+            return ['completed' => true, 'status' => $context->status, 'note' => 'node already executed (duplicate callback)'];
+        }
+
+        $context->status = 'running';
+        $context->nodeStatuses[$nodeID] = 'processing';
+
+        // 补写输出 → 标记 executed → checkpoint(与 executeNode 成功路径同构)
+        $context->getState()->setNodeOutputs($node, $outputs);
+        $context->getState()->addExecutedNode($node);
+        $context->nodeStatuses[$nodeID] = 'success';
+        $this->snapshots->ensureNodeSnapshot($nodeID);
+        $this->snapshots->updateNodeSnapshot($nodeID, [
+            'outputs' => $outputs,
+            'status' => 'success',
+            'logs' => [['level' => 'log', 'msg' => "completed via external callback (slow path: checkpoint reloaded)"]],
+        ]);
+        $this->checkpoint($context);
+
+        // 推进后继(与 executeNext 相同语义)
+        $nextNodes = $this->getNextNodes($context, $node, null);
+        $this->executeNext($context, $node, $nextNodes);
+        if (! $context->isTerminated()) {
+            $context->status = 'success';
+        }
+        $context->endTime = microtime(true);
+        $this->tasks->update($context->taskID, [
+            'status' => $context->status,
+            'endTime' => $context->endTime,
+            'error' => $context->error,
+        ]);
+        $this->checkpoint($context);
+
+        return ['completed' => true, 'status' => $context->status, 'outputs' => $context->finalOutputs];
     }
 
     /**

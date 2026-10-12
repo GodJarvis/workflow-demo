@@ -123,6 +123,10 @@ HTTP :9501 ─────────┘        │                    │
 9. **go run 要求所有源文件同目录**:wire.go 必须与 code.go 一起落在 /task(引擎侧下发),跨目录双文件直接报错
 10. **GOCACHE 属主是容器内 nobody**:宿主清理需 sudo;生产应规划缓存目录 UID 或专用卷
 11. **Docker wait 的 next-exit 竞态**:秒级任务在 HTTP 常驻进程下偶发 30s 超时——容器已退出后调 `next-exit` 会永等"下一次退出";改用 `not-running`(电平语义,已退出立即返回)
+12. **Swoole BASE 模式无 worker 间管道**:`sendMessage` 仅 `SWOOLE_PROCESS` 模式支持(BASE 下返回 false,跨 worker 投递静默退化为慢路径)——Table 注册表必须配 PROCESS 模式
+13. **worker 内拿不到 Swoole Server**:worker 容器是 fork 后重建的,`ServerFactory::getServer()` 抛错;唯一可靠来源是 `BeforeWorkerStart` 事件(经 `config/autoload/listeners.php` 配置式注册注入;**@Listener 注解在本环境未生效**)
+14. **容器 PID1 不收割僵尸 + 重启正确姿势**:容器 PID1 是 `tail`,`kill -9` master 后 worker 孤儿变 Z 僵尸(占端口表项、干扰排障);**重启 server 一律 `docker restart wf-engine`**,不要在容器内 pkill/kill master
+15. **Swoole BASE 模式 reuseport 同源聚集**:同源 IP 连接倾向同一 worker,跨 worker 测试需并发或 PROCESS 轮询模式
 
 ## 快速开始
 
@@ -130,6 +134,7 @@ HTTP :9501 ─────────┘        │                    │
 # 1. 起引擎容器(复用 php84-swoole-hyperf 镜像,挂 docker.sock)并装依赖
 docker compose up -d wf-engine
 docker exec wf-engine sh -c "cd /var/project/workflow-demo && composer install"
+# 消息介质(按 callback_registry 选配):docker compose up -d redis rabbitmq
 
 # 2. 构建全部语言沙箱镜像(五语言;编译型 golang/java 亦在此列)
 docker compose build wf-sandbox-python wf-sandbox-node wf-sandbox-php wf-sandbox-golang wf-sandbox-java
@@ -224,9 +229,47 @@ docker/
 
 ## 异步长耗时节点(LLM 生视频等)的执行模型
 
-**引擎零改动**:协程模型下,executor 内的协程化等待(`Coroutine::sleep`、协程 hook 的 curl)让出协程、不占 worker——实测 video 节点挂起 8002ms 期间,普通工作流 548ms 照常完成(同 worker 并发)。要点:executor 内禁用阻塞 `sleep`;超时自持(`llm.timeout` / video `totalTimeout`);`workflow_timeout` 放宽或置 -1。
+**第一层(协程挂起)**:引擎零改动,executor 内协程化等待让出协程、不占 worker——实测 video 挂起 8002ms 期间,普通工作流 548ms 照常完成(同 worker 并发)。
 
-**生产 durable 形态**(未实现,改造清单见教学手册 03§7):任务外置 + 节点 `waiting` 状态 + 定时器轮询 + checkpoint 持久化外部 taskId——解决协程内等待"崩溃即重跑/重复计费"的可靠性问题;同时 `run` 接口宜改为立即返回 taskID 的异步任务式。
+**第二层(回调闭环,已落地)**:`examples/async-callback-flow.json` + `POST /workflow/callback`,双路径架构:
+
+```
+外部完成回调 → ① 落库(事实源,无论等待者死活)
+             → ② 快路径:CallbackWaiterRegistry 命中(同进程)→ Channel push,挂起协程毫秒级续跑
+             → ③ 慢路径:未命中(跨进程/进程重启)→ checkpoint 重载 + completeExternalTask 推进
+```
+
+三剧本实测(`X-Callback-Token: demo-token`,taskId 在 `.runs/<taskID>/nodes/render/waiting-callback.json`):
+
+```bash
+# 剧本1 快路径:终端A run 挂起(HTTP)→ 终端B 回调 → delivered=channel,run 响应直接返回结果
+curl -s -X POST :49601/workflow/run -d '{"workflow":"async-callback-flow","inputs":{"topic":"x"}}' &
+curl -X POST :49601/workflow/callback -H 'X-Callback-Token: demo-token' \
+  -d '{"taskId":"<waiting-callback.json 里的 taskId>","outputs":{"videoUrl":"https://ext/v.mp4"}}'
+
+# 剧本2 跨进程:CLI run 挂起 + HTTP 回调 → delivered=reloaded(Channel 跨进程不通的活教材,
+#          慢路径重载推进,report 显示 success,CLI 侧超时报错以 report 为准)
+
+# 剧本3 重启 killer:run 挂起 → kill server(等待者死)→ 重启 → 回调 →照样 reloaded 推进至 success
+
+# 幂等:已投递的 taskId 再回调 → "not found or already delivered"(索引即一次性投递凭据)
+```
+
+**组件**:`Engine/Waiter/` 四实现注册表(见下表)| `TaskStore` 回调索引与事实(JSON 文件,生产替换点 Redis/DB)| `Engine::completeExternalTask`(慢路径重载推进)| `resume` 自动跳过等待回调节点(防外部任务重复提交)| 入口统一走黄金法则:落库 → 投递(deliver)→ 跨进程投出后 3s 延迟复查兜底(等待者死/投递丢 → completeExternalTask,幂等双推进安全)。
+
+**等待者注册表五实现**(config `workflow.callback_registry` 切换,跨进程流动的只有 taskId+outputs,Channel 永不出进程):
+
+| 实现 | 配置值 | 跨进程介质 | 翻译器 | 实测 |
+|---|---|---|---|---|
+| InMemory | `memory`(单 worker 专用) | 无 | deliver 直推 | in_process ✓ |
+| Table | `table`(**默认**,worker_num=2) | Swoole\Table 路由凭证 + `sendMessage` 定向管道 | `onPipeMessage` | 6/6 `pipe_message`(等待者 w1 ← 回调 w0)✓ |
+| RedisPubSub | `redis_pubsub` | Redis PUBLISH 广播 | 常驻订阅协程(惰性启动) | **跨进程**:CLI 挂起 + HTTP 回调 → CLI 进程内续跑 ✓ |
+| RedisStream | `redis_stream`(MQ 形态) | Redis Stream + 每进程独立消费组(持久化/XACK) | 常驻消费协程 | 跨进程 + 事件持久化(XLEN=1, pending=0)✓ |
+| RabbitMQ | `rabbitmq`(MQ 形态) | fanout exchange + 每进程 exclusive 队列(basic_ack 手动确认;php-amqplib 直连) | 常驻消费协程 | 跨进程:CLI 挂起 + HTTP 回调 → `amqp` → CLI 进程内续跑 ✓ |
+
+Table 模式依赖(已固化):`SWOOLE_PROCESS` 模式(**BASE 模式无 worker 间管道,sendMessage 不可用**)| `TableWaiterRegistry::boot()` 于 master 阶段(config/server.php 顶部,fork 前创建才共享)| `WorkerServerHolderListener` 注入 server 引用(config/listeners.php 配置式注册——**注解 @Listener 在本环境不生效**)。
+
+**生产 durable 清单**(未实现部分见教学手册 03§7):多 worker/多实例路由、等待超时自动失败、run 异步任务式。
 
 ## 已知简化(demo → 生产的差距)
 

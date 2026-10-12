@@ -28,6 +28,32 @@ return [
         'mock'     => true,            // 教学默认:无 key 返回模拟文本;配好 key 后置 false
     ],
 
+    // 外部回调端点鉴权(POST /workflow/callback 的 X-Callback-Token;生产换 HMAC 签名)
+    'callback_token' => 'demo-token',
+
+    // ★ 回调等待者注册表实现(按部署形态切换,四实现语义见 app/Workflow/Engine/Waiter/):
+    //   'memory'       单 worker 专用(worker_num>1 时快路径必然失效,降级慢路径)—— InMemory
+    //   'table'        同机多 worker(默认)—— Swoole\Table 路由 + sendMessage 定向投递(Table 只存路由凭证,Channel 不出进程)
+    //   'redis_pubsub' 多实例/跨进程 —— Redis PUBLISH 广播 + 各进程常驻订阅协程(翻译器)
+    //   'redis_stream' MQ 形态 —— Redis Stream + 每进程独立消费组(持久化/ACK/断线补读;生产等价 RabbitMQ/Kafka)
+    //   'rabbitmq'    RabbitMQ 形态 —— fanout exchange + 每进程 exclusive 队列(广播 + 手动 ack 消费确认)
+    'callback_registry' => 'table',
+
+    // redis_pubsub / redis_stream 模式的 Redis 连接(compose 内置 redis 服务)
+    'callback_redis' => [
+        'host' => 'redis',
+        'port' => 6379,
+    ],
+
+    // rabbitmq 模式的连接(compose 内置 rabbitmq 服务,管理界面 :15672 guest/guest)
+    'callback_amqp' => [
+        'host' => 'rabbitmq',
+        'port' => 5672,
+        'user' => 'guest',
+        'password' => 'guest',
+        'vhost' => '/',
+    ],
+
     // 引擎容器内路径前缀 => 宿主机路径前缀(供 docker run 挂载换算)
     'path_map' => [
         '/var/project/workflow-demo' => '/home/zw/www/workflow-demo',

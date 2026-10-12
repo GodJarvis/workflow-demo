@@ -1,0 +1,97 @@
+{
+  "id": "async-callback-flow",
+  "comment": "回调闭环教学示例(双路径):start → video(asyncCallback 提交后挂起等唤醒)→ end。运行后 cat .runs/<taskID>/nodes/render/waiting-callback.json 拿 taskId 发回调:同进程(HTTP run)回调 → 快路径 Channel 续跑;CLI 进程跑+HTTP 回调 → 慢路径重载推进(跨进程 Channel 不通的活教材)。中途重启引擎后回调照样续跑。",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "data": {
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "render",
+      "type": "video",
+      "data": {
+        "title": "视频生成(异步回调)",
+        "asyncCallback": true,
+        "callbackTimeout": 120,
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "type": "string"
+            }
+          }
+        },
+        "inputsValues": {
+          "prompt": {
+            "type": "template",
+            "content": "为主题「{{start.topic}}」生成视频"
+          }
+        },
+        "outputsSchema": {
+          "type": "object",
+          "properties": {
+            "taskId": {
+              "type": "string"
+            },
+            "videoUrl": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "end",
+      "type": "end",
+      "data": {
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "videoUrl": {
+              "type": "string"
+            },
+            "taskId": {
+              "type": "string"
+            }
+          }
+        },
+        "inputsValues": {
+          "videoUrl": {
+            "type": "ref",
+            "content": [
+              "render",
+              "videoUrl"
+            ]
+          },
+          "taskId": {
+            "type": "ref",
+            "content": [
+              "render",
+              "taskId"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "start",
+      "to": "render"
+    },
+    {
+      "from": "render",
+      "to": "end"
+    }
+  ]
+}

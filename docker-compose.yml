@@ -22,6 +22,20 @@ services:
       sh -c "command -v python3 >/dev/null 2>&1 || (sed -i 's#dl-cdn.alpinelinux.org#mirrors.ustc.edu.cn#g' /etc/apk/repositories && apk add --no-cache python3 nodejs util-linux);tail -f /dev/null"
     restart: always
 
+  # redis 服务:redis_pubsub / redis_stream 回调注册表模式的介质
+  # (Pub/Sub 广播与 Stream 消费组,引擎容器经服务名 redis:6379 直连)
+  redis:
+    image: redis:7-alpine
+    container_name: wf-redis
+    restart: unless-stopped
+
+  # rabbitmq 服务:rabbitmq 回调注册表模式的介质(fanout 广播 + 手动 ack)
+  # 3-alpine 轻量版(无管理界面;需要 UI 可换 3-management-alpine 并放行 15672)
+  rabbitmq:
+    image: rabbitmq:3-alpine
+    container_name: wf-rabbitmq
+    restart: unless-stopped
+
   # 以下为三个语言沙箱镜像的构建期定义(docker compose build wf-sandbox-python 等)
   # 运行期不需要常驻:由引擎每次 docker run --rm 一次性拉起
   wf-sandbox-python:

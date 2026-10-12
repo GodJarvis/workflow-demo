@@ -72,6 +72,30 @@ class WorkflowController
         });
     }
 
+    /**
+     * POST /workflow/callback — 外部系统完成事件回调(异步节点闭环入口)
+     * 鉴权:X-Callback-Token(config workflow.callback_token)。
+     * 处理:落库 → 快路径唤醒同进程等待者 / 慢路径 checkpoint 重载推进
+     */
+    public function callback(RequestInterface $request): array
+    {
+        return $this->wrap(function () use ($request) {
+            $token = (string) $request->getHeaderLine('X-Callback-Token');
+            $expected = (string) ApplicationContext::getContainer()
+                ->get(\Hyperf\Contract\ConfigInterface::class)
+                ->get('workflow.callback_token', 'demo-token');
+            if ($token === '' || ! hash_equals($expected, $token)) {
+                throw new BusinessException('invalid or missing X-Callback-Token', WorkflowErrorCode::DSL_INVALID->value);
+            }
+            $taskId = (string) $this->required($request, 'taskId');
+            $outputs = $request->input('outputs', []);
+            if (is_string($outputs)) {
+                $outputs = json_decode($outputs, true) ?: [];
+            }
+            return $this->app()->callback($taskId, is_array($outputs) ? $outputs : []);
+        });
+    }
+
     // ---------------------------------------------------------------- 内部方法
 
     private function app(): WorkflowApplication
