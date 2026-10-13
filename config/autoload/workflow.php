@@ -54,6 +54,14 @@ return [
         'vhost' => '/',
     ],
 
+    // ★ 任务队列(生产形态:async-run 入队 / 回调推进,消费者见 app/Process/WorkflowConsumerProcess)
+    //   'redis_stream'(默认)—— Redis Stream 单组竞争消费(每任务只处理一次;XACK/断线补读)
+    //   'rabbitmq'           —— RabbitMQ work queue(durable+persistent+ACK,跨重启不丢)
+    'task_queue' => 'redis_stream',
+
+    // 消费进程协程池大小 = 工作流并发上限(削峰;超过的任务在队列排队)
+    'consumer_pool_size' => 4,
+
     // 引擎容器内路径前缀 => 宿主机路径前缀(供 docker run 挂载换算)
     'path_map' => [
         '/var/project/workflow-demo' => '/home/zw/www/workflow-demo',

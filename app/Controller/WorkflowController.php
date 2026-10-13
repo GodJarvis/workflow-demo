@@ -73,9 +73,88 @@ class WorkflowController
     }
 
     /**
+     * POST /workflow/async-run — 生产形态入口:校验+建 Task+入队,毫秒级返回 taskID
+     * 执行由独立消费进程(WorkflowConsumerProcess)池化完成,连接不阻塞;
+     * 进度经 GET /workflow/events(SSE)或 POST /workflow/report 查询
+     */
+    public function asyncRun(RequestInterface $request): array
+    {
+        return $this->wrap(function () use ($request) {
+            $workflow = (string) $this->required($request, 'workflow');
+            $workflowFile = BASE_PATH . '/examples/' . basename($workflow, '.json') . '.json';
+            if (! is_file($workflowFile)) {
+                throw new BusinessException("workflow file not found: {$workflow}", WorkflowErrorCode::WORKFLOW_NOT_FOUND->value);
+            }
+            $inputs = $request->input('inputs', []);
+            if (is_string($inputs)) {
+                $inputs = json_decode($inputs, true) ?: [];
+            }
+            $taskID = $this->app()->submit($workflowFile, is_array($inputs) ? $inputs : []);
+            return ['taskID' => $taskID, 'status' => 'queued', 'events' => "/workflow/events?taskID={$taskID}"];
+        });
+    }
+
+    /**
+     * GET /workflow/events?taskID=xxx — SSE 事件流(任务进度推送)
+     * 实现:轮询 task.json/report.json 的变化推增量(500ms;教学注释:生产改 Redis
+     * Pub/Sub 广播 → SSE 端点订阅转发,引擎侧零轮询)。任务终态后发送 event:done 并关闭。
+     */
+    public function events(RequestInterface $request, \Hyperf\HttpServer\Contract\ResponseInterface $response)
+    {
+        $taskID = (string) $request->input('taskID', '');
+        if ($taskID === '') {
+            return $response->raw('taskID required')->withStatus(400);
+        }
+        $tasks = new \App\Workflow\Task\TaskStore(
+            \Hyperf\Context\ApplicationContext::getContainer()
+                ->get(\Hyperf\Contract\ConfigInterface::class)
+                ->get('workflow.runs_dir', BASE_PATH . '/.runs')
+        );
+
+        $response = $response
+            ->withHeader('Content-Type', 'text/event-stream; charset=utf-8')
+            ->withHeader('Cache-Control', 'no-cache')
+            ->withHeader('X-Accel-Buffering', 'no');
+
+        $lastSignature = '';
+        $start = microtime(true);
+        while (microtime(true) - $start < 300) {   // 最长 5 分钟
+            $task = $tasks->get($taskID);
+            if ($task === null) {
+                $response->write("event: error\ndata: {\"msg\":\"task not found\"}\n\n");
+                break;
+            }
+            // 状态摘要签名:任务状态 + 各节点状态(变化才推送)
+            $nodes = [];
+            $reportFile = $tasks->reportFile($taskID);
+            if (is_file($reportFile)) {
+                $report = json_decode((string) file_get_contents($reportFile), true) ?: [];
+                foreach ($report['nodes'] ?? [] as $nodeID => $snapshot) {
+                    $nodes[$nodeID] = $snapshot['status'] ?? 'pending';
+                }
+            }
+            $signature = md5(json_encode([$task['status'], $nodes]));
+            if ($signature !== $lastSignature) {
+                $lastSignature = $signature;
+                $payload = json_encode([
+                    'taskID' => $taskID, 'status' => $task['status'],
+                    'nodes' => $nodes, 'ts' => round(microtime(true) * 1000),
+                ], JSON_UNESCAPED_UNICODE);
+                $response->write("event: progress\ndata: {$payload}\n\n");
+            }
+            if (in_array($task['status'], ['success', 'failed'], true)) {
+                $response->write("event: done\ndata: {\"status\":\"{$task['status']}\"}\n\n");
+                break;
+            }
+            \Swoole\Coroutine::sleep(0.5);
+        }
+        return $response;
+    }
+
+    /**
      * POST /workflow/callback — 外部系统完成事件回调(异步节点闭环入口)
      * 鉴权:X-Callback-Token(config workflow.callback_token)。
-     * 处理:落库 → 快路径唤醒同进程等待者 / 慢路径 checkpoint 重载推进
+     * 处理:落库 + 投递任务队列(毫秒返回);推进由消费进程单点执行
      */
     public function callback(RequestInterface $request): array
     {

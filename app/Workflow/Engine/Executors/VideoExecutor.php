@@ -157,7 +157,32 @@ class VideoExecutor implements NodeExecutorInterface
         $context->nodeStatuses[$node->id] = 'waiting';
 
         try {
-            $result = $channel->pop($timeout);   // ★挂起:本进程被投递唤醒即毫秒级续跑;无人投递则超时兜底
+            // 短周期 pop + 任务终态感知:唤醒可能来自本进程 Registry push(快),
+            // 也可能来自消费进程的 checkpoint 重载推进(异步模式下等待者无法被跨进程 push)——
+            // 因此每 POP_SLICE 秒醒来检查一次任务状态,发现已被外部完成即读 checkpoint 优雅收敛
+            // (executeNode 后续链路幂等:变量重写同值、已执行节点直接跳过,双推进安全)
+            $result = false;
+            $deadline = microtime(true) + $timeout;
+            while (microtime(true) < $deadline) {
+                $result = $channel->pop(3);
+                if ($result !== false) {
+                    break;   // 快路径:被 push 唤醒
+                }
+                $task = $tasks->get($context->taskID);
+                if ($task !== null && in_array($task['status'], ['success', 'failed'], true)) {
+                    // 任务已被其它推进方完成(消费进程)→ 从 checkpoint 恢复本节点输出后收敛
+                    $checkpoint = $tasks->loadCheckpoint($context->taskID);
+                    $nodeOutputs = $checkpoint['variables'][$node->id] ?? [];
+                    $result = [];
+                    foreach ($nodeOutputs as $key => $var) {
+                        $result[$key] = $var['value'] ?? null;
+                    }
+                    return [
+                        'outputs' => $result,
+                        'logs' => [['level' => 'log', 'msg' => "video task {$taskId} completed by external advancement (converged from checkpoint)"]],
+                    ];
+                }
+            }
         } finally {
             $registry->remove($taskId);
             @unlink($waitingFile);

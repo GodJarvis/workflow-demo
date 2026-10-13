@@ -104,16 +104,87 @@ class WorkflowApplication
     }
 
     /**
-     * 外部回调处理(黄金法则全流程):
-     *   ① 先落库(事实源,无论等待者死活)
-     *   ② 投递唤醒:按 config 的 Registry 实现(memory/table/redis_pubsub/redis_stream)
-     *      - in_process:同进程已 push,挂起协程毫秒级续跑
-     *      - pipe_message/pubsub/stream:已投跨进程介质,由接收端翻译器认领;
-     *        同时启动【延迟复查】协程 —— 若 3s 后工作流仍未推进(等待者已死/投递丢失),
-     *        触发慢路径重载推进(completeExternalTask 幂等,双推进安全)
-     *      - none:无人等待 → 本进程立即慢路径
-     * 幂等:重复回调 → 索引已移除则拒绝;节点已完成 → completeExternalTask 返回现状
-     *
+     * 异步提交(生产形态):校验 + 建 Task(queued) + inputs 持久化 + 入队
+     * 毫秒级返回 taskID;执行由 WorkflowConsumerProcess(独立进程消费池)完成
+     * 结果经 report 轮询 / SSE(workflow/events)获取
+     */
+    public function submit(string $workflowFile, array $inputs): string
+    {
+        $document = Document::fromJsonFile($workflowFile);
+        $this->assertValid($document);
+
+        $taskID = 'task_' . bin2hex(random_bytes(4));
+        $this->tasks->create($taskID, (string) ($document->definition['id'] ?? pathinfo($workflowFile, PATHINFO_FILENAME)));
+        // inputs 持久化:消费进程与提交方解耦的凭据
+        file_put_contents(
+            $this->tasks->taskDir($taskID) . '/inputs.json',
+            json_encode(['inputs' => $inputs], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT),
+        );
+
+        $queued = \App\Workflow\Queue\TaskQueueFactory::make()->publish(['type' => 'run', 'taskID' => $taskID]);
+        if (! $queued) {
+            $this->tasks->update($taskID, ['status' => 'failed', 'error' => 'task queue publish failed']);
+            throw new \RuntimeException('task queue unavailable (check workflow.task_queue config)');
+        }
+        return $taskID;
+    }
+
+    /**
+     * 消费进程入口:加载 Task 的 DSL+inputs → 引擎执行(与同步 run 同一执行核心)
+     * @return array<string, mixed>
+     */
+    public function executeTask(string $taskID): array
+    {
+        $task = $this->tasks->get($taskID) ?? throw new \RuntimeException("Task not found: {$taskID}");
+        $workflowFile = BASE_PATH . '/examples/' . $task['workflow'] . '.json';
+        $document = Document::fromJsonFile($workflowFile);
+
+        $inputs = [];
+        $inputsFile = $this->tasks->taskDir($taskID) . '/inputs.json';
+        if (is_file($inputsFile)) {
+            $decoded = json_decode((string) file_get_contents($inputsFile), true);
+            $inputs = is_array($decoded['inputs'] ?? null) ? $decoded['inputs'] : [];
+        }
+
+        $snapshots = SnapshotCenter::load($this->tasks->reportFile($taskID));
+        $snapshots->init((string) ($document->definition['id'] ?? 'workflow'));
+
+        $context = WorkflowContext::create($taskID, $document, $inputs);
+        $engine = new Engine(ExecutorRegistry::default(), $this->tasks, $snapshots);
+        $this->runInCoroutine(fn () => $engine->process($context), $this->workflowTimeout);
+
+        return [
+            'taskID' => $taskID,
+            'status' => $context->status,
+            'outputs' => $context->finalOutputs,
+            'error' => $context->error,
+            'timeCost' => round(($context->endTime - $context->startTime) * 1000) . 'ms',
+        ];
+    }
+
+    /**
+     * 消费进程处理回调消息:单点决策消灭双推进竞态
+     *   ① Registry deliver(同步模式等待者即时唤醒,若可命中)→ 完成
+     *   ② 未命中(异步任务无等待者/等待者已死)→ checkpoint 重载推进(幂等)
+     * @param array<string, mixed> $outputs
+     * @return array<string, mixed>
+     */
+    public function handleCallbackMessage(string $externalTaskId, array $outputs): array
+    {
+        $registry = \App\Workflow\Engine\Waiter\WaiterRegistryFactory::make();
+        $delivered = $registry->deliver($externalTaskId, $outputs);
+        if ($delivered !== 'none') {
+            // 同步等待者已被唤醒(等待方主流程收尾)
+            $this->tasks->unindexCallback($externalTaskId);
+            return ['delivered' => $delivered, 'note' => 'waiter resumed'];
+        }
+        return $this->advanceUnclaimed($externalTaskId, $outputs);
+    }
+
+    /**
+     * 外部回调处理(黄金法则:API 只做落库+入队,推进在消费进程)
+     *   ① 落库(事实源,无论后续如何)
+     *   ② 投递"继续消息"到任务队列 → 消费者单点推进(削峰+同任务 FIFO 串行化)
      * @param array<string, mixed> $outputs
      * @return array<string, mixed>
      */
@@ -122,57 +193,25 @@ class WorkflowApplication
         $index = $this->tasks->loadCallbackIndex();
         $entry = $index[$taskId] ?? throw new \RuntimeException("Callback taskId not found or already delivered: {$taskId}");
         $taskID = (string) $entry['taskID'];
-        $nodeID = (string) $entry['nodeID'];
 
-        // ① 落库(永远先做;审计与幂等的事实源)
+        // ① 落库(审计与幂等的事实源)
         $factState = $this->tasks->saveCallbackFact($taskID, $taskId, ['outputs' => $outputs]);
 
-        // ② 投递唤醒(尽力而为,at-most-once)
-        $registry = \App\Workflow\Engine\Waiter\WaiterRegistryFactory::make();
-        $delivered = $registry->deliver($taskId, $outputs);
-
-        if ($delivered === 'in_process') {
-            $this->tasks->unindexCallback($taskId);
-            return [
-                'delivered' => 'in_process',
-                'fact' => $factState,
-                'taskID' => $taskID,
-                'note' => 'fast path: suspended coroutine resumed in-process',
-            ];
+        // ② 入队(毫秒级返回;推进由消费进程 handleCallbackMessage 单点执行)
+        $queued = \App\Workflow\Queue\TaskQueueFactory::make()->publish([
+            'type' => 'callback',
+            'externalTaskId' => $taskId,
+            'outputs' => $outputs,
+        ]);
+        if (! $queued) {
+            throw new \RuntimeException('task queue unavailable on callback dispatch');
         }
 
-        if ($delivered !== 'none') {
-            // 已投跨进程介质:保留索引(接收端/兜底方完成后再清理);
-            // 延迟复查 —— 覆盖"投递丢失"与"等待者已死"两种未认领场景
-            // (投递方式可能是管道消息/广播/流,入口无法预知接收结果)
-            \Swoole\Coroutine::create(function () use ($taskId, $taskID, $nodeID, $outputs, $delivered): void {
-                \Swoole\Coroutine::sleep(3);
-                $task = $this->tasks->get($taskID);
-                $done = $task !== null && in_array($task['status'], ['success', 'failed'], true);
-                if (! $done) {
-                    // 快路径没有兑现(等待者死/投递丢)→ 慢路径接管(completeExternalTask 幂等:
-                    // 若此刻快路径恰好也完成了,其 isExecutedNode 检查会直接返回现状,双推进安全)
-                    $this->advanceExternalTask($taskID, $nodeID, $outputs);
-                    $this->tasks->unindexCallback($taskId);
-                }
-            });
-            return [
-                'delivered' => $delivered,
-                'fact' => $factState,
-                'taskID' => $taskID,
-                'note' => 'dispatched via ' . $delivered . '; unclaimed fallback armed (3s recheck)',
-            ];
-        }
-
-        // none:无人等待(等待者已死/CLI 无 server 的 table 模式等)→ 本进程立即慢路径
-        $result = $this->advanceExternalTask($taskID, $nodeID, $outputs);
-        $this->tasks->unindexCallback($taskId);
         return [
-            'delivered' => 'reloaded',
+            'queued' => true,
             'fact' => $factState,
             'taskID' => $taskID,
-            'result' => $result,
-            'note' => 'slow path: checkpoint reloaded and workflow advanced by callback handler',
+            'note' => 'dispatched to task queue; consumer will advance the workflow',
         ];
     }
 

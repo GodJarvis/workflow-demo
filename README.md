@@ -271,10 +271,33 @@ Table 模式依赖(已固化):`SWOOLE_PROCESS` 模式(**BASE 模式无 worker �
 
 **生产 durable 清单**(未实现部分见教学手册 03§7):多 worker/多实例路由、等待超时自动失败、run 异步任务式。
 
+## 生产形态:任务队列异步消费(async-run)
+
+**为什么**:阻塞式 run 的资源账本——一个进行中任务 = 1 连接 + 1 请求协程长期挂死;批量长任务 → `max_connection`(ulimit fd)先爆,吞吐与连接数绑死。
+
+```
+POST /workflow/async-run ──校验→ Task(queued)+inputs 持久化→ 入队 → 202 {taskID}(实测 15ms,连接零占用)
+POST /workflow/callback  ──落库→ 投"继续消息" → 202(毫秒返回)
+        ┌── 任务队列(竞争消费:XACK/断线补读)──┐
+   WorkflowConsumerProcess(hyperf/process 独立进程)  │
+   │ 消费协程池(池大小=并发上限=削峰)                  │
+   │  run 消息      → executeTask(引擎零改动)         │
+   │  callback 消息 → Registry deliver(同步等待者)     │
+   │                  未命中 → completeExternalTask    │
+   │                  (单点决策,消灭双推进竞态)        │
+   状态:report 轮询 / GET /workflow/events(SSE progress/done 事件)
+```
+
+**双队列实现**(config `workflow.task_queue`,与五 Registry 的广播语义对照——**任务队列=竞争消费,唤醒=广播**):`redis_stream`(默认,单组多 consumer)/ `rabbitmq`(work queue:durable + persistent + ACK,跨重启不丢)。
+
+**验证**:批量 20 并发提交 19ms 全收 → 池化消化;异步回调闭环(async-run→waiting→callback 入队→消费进程推进→success);SSE progress/done 正常;RabbitMQ 队列消费干净(messages=0);**同步模式零破坏**(等待者升级为"短周期 pop + 任务终态感知":被消费进程推进后 ≤3s 从 checkpoint 收敛,executeNode 链路幂等)。
+
 ## 已知简化(demo → 生产的差距)
 
 | 项 | demo 做法 | 生产建议 |
 |---|---|---|
+| SSE 推送 | 端点内 500ms 轮询 report 差量 | 引擎状态变化 publish Redis Pub/Sub,SSE 端点订阅转发(零轮询) |
+| 队列重投 | 失败不 ACK 留 pending | XAUTOCLAIM(Redis)/ 死信队列 + 重试上限(RabbitMQ) |
 | 沙箱调度 | 引擎容器挂 docker.sock 直调 Engine API | 独立 sandbox-manager 服务(gRPC),按租户配额 + 预热池 |
 | 挂载路径 | `workflow.path_map` 手工映射容器↔宿主路径 | 沙箱专用共享存储(NFS/对象存储)或同宿主部署 |
 | 文件权限 | 任务目录 chmod 0777(nobody 可写) | 专用 UID 规划 + uidmap |

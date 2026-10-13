@@ -13,5 +13,9 @@ Router::post('/workflow/report', [WorkflowController::class, 'report']);
 Router::post('/workflow/validate', [WorkflowController::class, 'validate']);
 // 从最后 checkpoint 恢复执行中断的任务(演示可序列化 Context)
 Router::post('/workflow/resume', [WorkflowController::class, 'resume']);
-// 外部系统完成事件回调(异步节点闭环:X-Callback-Token 鉴权,落库+双路径推进)
+// 外部系统完成事件回调(异步节点闭环:X-Callback-Token 鉴权,落库+入队,消费进程单点推进)
 Router::post('/workflow/callback', [WorkflowController::class, 'callback']);
+// 生产形态异步入口:入队即返回 taskID,连接零占用(消费进程池化执行)
+Router::post('/workflow/async-run', [WorkflowController::class, 'asyncRun']);
+// SSE 任务进度事件流(?taskID=xxx):progress/done 事件,任务终态后关闭
+Router::get('/workflow/events', [WorkflowController::class, 'events']);
