@@ -151,7 +151,13 @@ class WorkflowApplication
 
         $context = WorkflowContext::create($taskID, $document, $inputs);
         $engine = new Engine(ExecutorRegistry::default(), $this->tasks, $snapshots);
-        $this->runInCoroutine(fn () => $engine->process($context), $this->workflowTimeout);
+        // 队列模式:deferred 节点"注册即暂停"释放消费协程(等待任务数不受池大小限制)
+        \App\Workflow\Engine\AsyncContext::enterQueueMode();
+        try {
+            $this->runInCoroutine(fn () => $engine->process($context), $this->workflowTimeout);
+        } finally {
+            \App\Workflow\Engine\AsyncContext::leaveQueueMode();
+        }
 
         return [
             'taskID' => $taskID,
@@ -225,6 +231,38 @@ class WorkflowApplication
     }
 
     /**
+     * 对账器兜底失败:外部任务 failed / 回调丢失超时 → 任务置败(幂等:终态不覆盖)
+     */
+    public function failExternalCallback(string $taskId, string $reason): void
+    {
+        $index = $this->tasks->loadCallbackIndex();
+        $entry = $index[$taskId] ?? null;
+        if ($entry === null) {
+            return;   // 已被回调路径处理
+        }
+        $taskID = (string) $entry['taskID'];
+        $task = $this->tasks->get($taskID);
+        if ($task !== null && in_array($task['status'], ['success', 'failed'], true)) {
+            $this->tasks->unindexCallback($taskId);
+            return;   // 已终态,不覆盖
+        }
+
+        // 从 checkpoint 恢复上下文置败(保留快照与变量现场,便于排查)
+        $snapshots = SnapshotCenter::load($this->tasks->reportFile($taskID));
+        $engine = new Engine(ExecutorRegistry::default(), $this->tasks, $snapshots);
+        $nodeID = (string) $entry['nodeID'];
+        \App\Workflow\Engine\AsyncContext::enterQueueMode();
+        try {
+            $this->runInCoroutine(function () use ($engine, $taskID, $nodeID, $reason): void {
+                $engine->failExternalTask($taskID, $nodeID, $reason);
+            }, 60);
+        } finally {
+            \App\Workflow\Engine\AsyncContext::leaveQueueMode();
+        }
+        $this->tasks->unindexCallback($taskId);
+    }
+
+    /**
      * 未认领兜底:索引定位 → 慢路径推进(与 callback() 的 none 分支同一逻辑)
      */
     public function advanceUnclaimed(string $taskId, array $outputs): void
@@ -247,9 +285,15 @@ class WorkflowApplication
         $snapshots = SnapshotCenter::load($this->tasks->reportFile($taskID));
         $engine = new Engine(ExecutorRegistry::default(), $this->tasks, $snapshots);
         $result = ['completed' => false];
-        $this->runInCoroutine(function () use ($engine, &$result, $taskID, $nodeID, $outputs): void {
-            $result = $engine->completeExternalTask($taskID, $nodeID, $outputs);
-        }, $this->workflowTimeout);
+        // 推进链同样在队列模式:推进中遇到下一个 deferred 节点 → 再次暂停释放(而非挂起)
+        \App\Workflow\Engine\AsyncContext::enterQueueMode();
+        try {
+            $this->runInCoroutine(function () use ($engine, &$result, $taskID, $nodeID, $outputs): void {
+                $result = $engine->completeExternalTask($taskID, $nodeID, $outputs);
+            }, $this->workflowTimeout);
+        } finally {
+            \App\Workflow\Engine\AsyncContext::leaveQueueMode();
+        }
         return $result;
     }
 

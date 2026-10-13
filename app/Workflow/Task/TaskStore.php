@@ -105,10 +105,17 @@ class TaskStore
         file_put_contents(rtrim($this->runsDir, '/') . '/callback-index.json', json_encode($index, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
     }
 
-    public function indexCallback(string $taskId, string $taskID, string $nodeID): void
+    public function indexCallback(string $taskId, string $taskID, string $nodeID, ?string $pollUrl = null, ?float $deadline = null): void
     {
         $index = $this->loadCallbackIndex();
-        $index[$taskId] = ['taskID' => $taskID, 'nodeID' => $nodeID, 'createdAt' => microtime(true)];
+        $index[$taskId] = [
+            'taskID' => $taskID,
+            'nodeID' => $nodeID,
+            'createdAt' => microtime(true),
+            // 对账兜底凭据:pollUrl=外部状态查询句柄({taskId} 占位);deadline=回调丢失超时线
+            'pollUrl' => $pollUrl,
+            'deadline' => $deadline,
+        ];
         $this->saveCallbackIndex($index);
     }
 

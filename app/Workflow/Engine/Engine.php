@@ -43,21 +43,40 @@ class Engine
         try {
             $this->executeNode($context, $context->document->getStartNode());
             // start 无后继等异常场景兜底:只要没终止且没到 end,由递归内的 throw 处理
-            if (! $context->isTerminated()) {
+            if (! $context->isTerminated() && ! $this->hasWaitingNodes($context)) {
                 $context->status = 'success';
             }
+            // 存在 waiting(等待外部回调)节点 → 保持 running(任务暂停态)
+        } catch (TaskDeferredException) {
+            // 队列模式暂停:任务保持 running,等待回调消息推进(completeExternalTask)
         } catch (\Throwable $e) {
             $context->status = 'failed';
             $context->error = $e->getMessage();
         } finally {
-            $context->endTime = microtime(true);
+            // 非 failed/cancelled 时 endTime 不定稿(deferred 挂起仍在计时中)
+            if ($context->isTerminated()) {
+                $context->endTime = microtime(true);
+            }
             $this->tasks->update($context->taskID, [
                 'status' => $context->status,
-                'endTime' => $context->endTime,
+                'endTime' => $context->isTerminated() ? $context->endTime : null,
                 'error' => $context->error,
             ]);
             $this->checkpoint($context);
         }
+    }
+
+    /**
+     * 是否存在等待外部回调的节点(任务暂停判定)
+     */
+    private function hasWaitingNodes(WorkflowContext $context): bool
+    {
+        foreach ($context->nodeStatuses as $status) {
+            if ($status === 'waiting') {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -112,7 +131,7 @@ class Engine
                 });
             }
             $wg->wait();
-            if (! $context->isTerminated()) {
+            if (! $context->isTerminated() && ! $this->hasWaitingNodes($context)) {
                 $context->status = 'success';
             }
         } catch (\Throwable $e) {
@@ -129,6 +148,45 @@ class Engine
                 $this->checkpoint($context);
             }
         }
+    }
+
+    /**
+     * 对账兜底失败:等待外部回调的节点置败并收敛任务终态(幂等:已终态/已执行则跳过)
+     */
+    public function failExternalTask(string $taskID, string $nodeID, string $reason): void
+    {
+        $task = $this->tasks->get($taskID);
+        if ($task === null || in_array($task['status'], ['success', 'failed'], true)) {
+            return;
+        }
+        $checkpoint = $this->tasks->loadCheckpoint($taskID);
+        if ($checkpoint === null) {
+            $this->tasks->update($taskID, ['status' => 'failed', 'endTime' => microtime(true), 'error' => $reason]);
+            return;
+        }
+        $document = Document::fromJsonFile(BASE_PATH . '/examples/' . $task['workflow'] . '.json');
+        $context = WorkflowContext::restore($checkpoint, $document);
+
+        $node = $document->getNode($nodeID);
+        if ($node !== null && ! $context->getState()->isExecutedNode($node)) {
+            $context->nodeStatuses[$nodeID] = 'failed';
+            $this->snapshots->ensureNodeSnapshot($nodeID);
+            $this->snapshots->updateNodeSnapshot($nodeID, [
+                'status' => 'failed',
+                'error' => $reason,
+                'logs' => [['level' => 'error', 'msg' => "reconciler: {$reason}"]],
+            ]);
+        }
+
+        $context->status = 'failed';
+        $context->error = $reason;
+        $context->endTime = microtime(true);
+        $this->tasks->update($taskID, [
+            'status' => 'failed',
+            'endTime' => $context->endTime,
+            'error' => $reason,
+        ]);
+        $this->checkpoint($context);
     }
 
     /**
@@ -170,18 +228,25 @@ class Engine
         // 推进后继(与 executeNext 相同语义)
         $nextNodes = $this->getNextNodes($context, $node, null);
         $this->executeNext($context, $node, $nextNodes);
-        if (! $context->isTerminated()) {
+        if (! $context->isTerminated() && ! $this->hasWaitingNodes($context)) {
             $context->status = 'success';
         }
-        $context->endTime = microtime(true);
-        $this->tasks->update($context->taskID, [
-            'status' => $context->status,
-            'endTime' => $context->endTime,
-            'error' => $context->error,
-        ]);
-        $this->checkpoint($context);
+        // 推进链上遇到下一个 deferred 节点 → 保持 running(再次暂停,等下一次回调)
+        if ($context->isTerminated()) {
+            $context->endTime = microtime(true);
+            $this->tasks->update($context->taskID, [
+                'status' => $context->status,
+                'endTime' => $context->endTime,
+                'error' => $context->error,
+            ]);
+            $this->checkpoint($context);
+        } else {
+            // 暂停态:保持 running,不写终态字段
+            $this->tasks->update($context->taskID, ['status' => $context->status]);
+            $this->checkpoint($context);
+        }
 
-        return ['completed' => true, 'status' => $context->status, 'outputs' => $context->finalOutputs];
+        return ['completed' => $context->isTerminated(), 'status' => $context->status, 'outputs' => $context->finalOutputs];
     }
 
     /**
@@ -234,6 +299,14 @@ class Engine
             // 每节点成功后落 checkpoint(可序列化 Context 的写入时机)
             $this->checkpoint($context);
         } catch (\Throwable $e) {
+            if ($e instanceof TaskDeferredException) {
+                // 队列模式的暂停:节点保持 waiting(非失败)、变量状态落 checkpoint、
+                // 上抛由 process/completeExternalTask 收敛为"任务 running 挂起"
+                $context->nodeStatuses[$node->id] = 'waiting';
+                $this->snapshots->updateNodeSnapshot($node->id, ['status' => 'waiting']);
+                $this->checkpoint($context);
+                throw $e;
+            }
             $context->nodeStatuses[$node->id] = 'failed';
             $this->snapshots->updateNodeSnapshot($node->id, [
                 'status' => 'failed',
@@ -339,9 +412,9 @@ class Engine
             Coroutine::create(function () use ($wg, $context, $nextNode): void {
                 try {
                     $this->executeNode($context, $nextNode);
-                } catch (\Throwable) {
-                    // 失败冒泡:标记一次终态即可,由各层 finally 收敛状态
-                    if (! $context->isTerminated()) {
+                } catch (\Throwable $e) {
+                    // 失败冒泡:标记一次终态即可;deferred 暂停:保持 running(等待回调)
+                    if (! $context->isTerminated() && ! $e instanceof TaskDeferredException) {
                         $context->status = 'failed';
                         $context->error = "node {$nextNode->id} failed";
                     }

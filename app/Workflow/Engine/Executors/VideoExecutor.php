@@ -132,12 +132,6 @@ class VideoExecutor implements NodeExecutorInterface
         $timeout = (int) ($node->data['callbackTimeout'] ?? 120);
         $taskId = 'vid_cb_' . bin2hex(random_bytes(4));
 
-        // ① 双注册:本地/跨进程等待者(按 config 选 Registry 实现)+ 持久化 taskId→node 索引(慢路径定位凭据)
-        $registry = WaiterRegistryFactory::make();
-        $channel = new Channel(1);
-        $registry->register($taskId, $channel, $context->taskID, $node->id);
-        $tasks->indexCallback($taskId, $context->taskID, $node->id);
-
         // ② waiting 提示文件:与文件协议同目录,CLI/用户 cat 此文件拿 taskId 发回调
         //    (video 节点不经 CodeExecutor,任务目录需自建)
         $nodeDir = rtrim($runsDir, '/') . "/{$context->taskID}/nodes/{$node->id}";
@@ -153,8 +147,28 @@ class VideoExecutor implements NodeExecutorInterface
             'createdAt' => microtime(true),
         ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
 
-        // ③ 节点状态 waiting + 挂起等待唤醒(等待者:本协程)
+        // ③ 持久化 taskId→node 索引(回调定位凭据 + 对账兜底凭据)
+        //    pollUrl:外部状态查询句柄(回调丢失时 Reconciler 主动查询;{taskId} 占位)
+        //    deadline:回调丢失超时线(now + data.pollTimeout,默认 600s)
+        $pollUrl = isset($node->data['pollUrl']) ? (string) $node->data['pollUrl'] : null;
+        $deadline = microtime(true) + (float) ($node->data['pollTimeout'] ?? 600);
+        $tasks->indexCallback($taskId, $context->taskID, $node->id, $pollUrl, $deadline);
         $context->nodeStatuses[$node->id] = 'waiting';
+
+        // ── 队列模式(异步消费):注册即暂停,释放消费协程 ──
+        // 等待回调的任务 = 0 连接 + 0 协程(纯存储态,数量仅受存储容量约束);
+        // 回调消息由消费进程 completeExternalTask 从 checkpoint 重载推进
+        // (waiting-callback.json 保留:回调方从这里拿 taskId)
+        if (\App\Workflow\Engine\AsyncContext::isQueueMode()) {
+            throw new \App\Workflow\Engine\TaskDeferredException(
+                "node {$node->id} waiting external callback taskId={$taskId}"
+            );
+        }
+
+        // ── 同步模式:协程挂起等待唤醒(短周期 pop + 任务终态感知)──
+        $registry = WaiterRegistryFactory::make();
+        $channel = new Channel(1);
+        $registry->register($taskId, $channel, $context->taskID, $node->id);
 
         try {
             // 短周期 pop + 任务终态感知:唤醒可能来自本进程 Registry push(快),

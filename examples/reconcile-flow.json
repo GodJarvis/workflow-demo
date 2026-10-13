@@ -1,0 +1,99 @@
+{
+  "id": "reconcile-flow",
+  "comment": "回调对账兜底教学示例:video 节点带 pollUrl(指向 mock-status 模拟外部系统)+pollTimeout(回调丢失超时线)。剧本A 回调丢失自愈:不发回调,写 mock 文件 .runs/<taskID>/mock-external/<taskId>.json 为 succeeded → 对账器查询自愈推进;剧本B 超时置败:什么都不做 → deadline 后任务 failed(callback lost)。",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "data": {
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "render",
+      "type": "video",
+      "data": {
+        "title": "视频生成(异步回调)",
+        "asyncCallback": true,
+        "callbackTimeout": 120,
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "type": "string"
+            }
+          }
+        },
+        "inputsValues": {
+          "prompt": {
+            "type": "template",
+            "content": "为主题「{{start.topic}}」生成视频"
+          }
+        },
+        "outputsSchema": {
+          "type": "object",
+          "properties": {
+            "taskId": {
+              "type": "string"
+            },
+            "videoUrl": {
+              "type": "string"
+            }
+          }
+        },
+        "pollUrl": "http://127.0.0.1:9501/workflow/mock-status?taskId={taskId}",
+        "pollTimeout": 45
+      }
+    },
+    {
+      "id": "end",
+      "type": "end",
+      "data": {
+        "inputsSchema": {
+          "type": "object",
+          "properties": {
+            "videoUrl": {
+              "type": "string"
+            },
+            "taskId": {
+              "type": "string"
+            }
+          }
+        },
+        "inputsValues": {
+          "videoUrl": {
+            "type": "ref",
+            "content": [
+              "render",
+              "videoUrl"
+            ]
+          },
+          "taskId": {
+            "type": "ref",
+            "content": [
+              "render",
+              "taskId"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "start",
+      "to": "render"
+    },
+    {
+      "from": "render",
+      "to": "end"
+    }
+  ]
+}

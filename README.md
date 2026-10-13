@@ -292,6 +292,17 @@ POST /workflow/callback  ──落库→ 投"继续消息" → 202(毫秒返回)
 
 **验证**:批量 20 并发提交 19ms 全收 → 池化消化;异步回调闭环(async-run→waiting→callback 入队→消费进程推进→success);SSE progress/done 正常;RabbitMQ 队列消费干净(messages=0);**同步模式零破坏**(等待者升级为"短周期 pop + 任务终态感知":被消费进程推进后 ≤3s 从 checkpoint 收敛,executeNode 链路幂等)。
 
+**池释放语义(等待任务数 ≠ poolSize)**:队列模式下 deferred 节点"注册即暂停"——executor 抛 `TaskDeferredException`(仅 `AsyncContext` 队列模式),Engine 感知:节点 waiting + checkpoint 落盘 + 任务保持 running → **消费协程立即归还池子**。两类并发的上限因此分离:
+
+| | 上限 | 机制 |
+|---|---|---|
+| 执行中(CPU/IO 活跃)工作流 | poolSize(削峰,特性) | 消费协程池 |
+| **等待回调中的任务** | **存储容量**(万级;0 连接 + 0 协程) | 纯存储态,回调消息驱动重载推进 |
+
+实测:poolSize=4 下提交 6 个回调等待流(全部 running 暂停)→ **第 7 个普通任务 2 秒完成**(池空闲证明)→ 逐个回调推进 6/6 success。推进链遇下一个 deferred 节点会再次暂停(`advanceExternalTask` 同在队列模式);同步模式(HTTP/CLI run)不受影响,仍走协程挂起 + 终态感知收敛。
+
+**回调对账兜底(Reconciliation)**:回调是"外部主动告知",天然不可靠——`CallbackReconciler`(消费进程内定时协程,config `reconcile_interval` 默认 30s)扫描所有未了结的回调索引:有 `pollUrl`(注册时随索引持久化的外部状态查询句柄)则主动 HTTP 查询,`succeeded` 充当"迟到的回调"推进(与回调路径同一收敛点,幂等)、`failed` 置败;超过 `deadline`(`pollTimeout`,默认 600s)则置败"callback lost"。**示例 `examples/reconcile-flow.json`**(pollUrl 指向 `/workflow/mock-status` 模拟外部系统,pollTimeout=45s):剧本A 回调丢失自愈(写 mock 文件→对账器 10s 内查询自愈推进,实测 success);剧本B 超时置败(45s failed "external callback lost");回调优先回归(正常回调即时,对账器不干扰)。教学:`.runs/<taskID>/mock-external/<taskId>.json` 即模拟外部状态的写入口。
+
 ## 已知简化(demo → 生产的差距)
 
 | 项 | demo 做法 | 生产建议 |

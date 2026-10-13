@@ -73,6 +73,31 @@ class WorkflowController
     }
 
     /**
+     * GET /workflow/mock-status?taskId=xxx — 模拟外部系统的状态查询接口(教学)
+     * 对账器(CallbackReconciler)经 pollUrl 查询此端点;"外部完成"由测试方写文件触发:
+     *   echo '{"status":"succeeded","outputs":{"videoUrl":"..."}}' > .runs/<taskID>/mock-external/<taskId>.json
+     */
+    public function mockStatus(RequestInterface $request, \Hyperf\HttpServer\Contract\ResponseInterface $response)
+    {
+        $taskId = (string) $request->input('taskId', '');
+        $config = ApplicationContext::getContainer()->get(\Hyperf\Contract\ConfigInterface::class);
+        $tasks = new \App\Workflow\Task\TaskStore((string) $config->get('workflow.runs_dir', BASE_PATH . '/.runs'));
+
+        $index = $tasks->loadCallbackIndex();
+        $entry = $index[$taskId] ?? null;
+        if ($entry === null) {
+            return $response->withStatus(404)->raw("unknown taskId {$taskId}");
+        }
+        $taskID = (string) $entry['taskID'];
+        $mockFile = $tasks->taskDir($taskID) . '/mock-external/' . $taskId . '.json';
+        if (! is_file($mockFile)) {
+            return $response->json(['status' => 'processing', 'taskId' => $taskId]);
+        }
+        $decoded = json_decode((string) file_get_contents($mockFile), true);
+        return $response->json(is_array($decoded) ? $decoded : ['status' => 'processing']);
+    }
+
+    /**
      * POST /workflow/async-run — 生产形态入口:校验+建 Task+入队,毫秒级返回 taskID
      * 执行由独立消费进程(WorkflowConsumerProcess)池化完成,连接不阻塞;
      * 进度经 GET /workflow/events(SSE)或 POST /workflow/report 查询

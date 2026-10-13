@@ -62,6 +62,10 @@ return [
     // 消费进程协程池大小 = 工作流并发上限(削峰;超过的任务在队列排队)
     'consumer_pool_size' => 4,
 
+    // 回调对账器间隔(秒):扫描等待回调的任务 → pollUrl 状态查询自愈 / deadline 超时置败
+    // (演示可调短,如 10;生产 30~60)
+    'reconcile_interval' => 10,
+
     // 引擎容器内路径前缀 => 宿主机路径前缀(供 docker run 挂载换算)
     'path_map' => [
         '/var/project/workflow-demo' => '/home/zw/www/workflow-demo',

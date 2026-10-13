@@ -19,3 +19,5 @@ Router::post('/workflow/callback', [WorkflowController::class, 'callback']);
 Router::post('/workflow/async-run', [WorkflowController::class, 'asyncRun']);
 // SSE 任务进度事件流(?taskID=xxx):progress/done 事件,任务终态后关闭
 Router::get('/workflow/events', [WorkflowController::class, 'events']);
+// 模拟外部系统的状态查询接口(教学):对账器 pollUrl 指向这里,写文件控状态
+Router::get('/workflow/mock-status', [WorkflowController::class, 'mockStatus']);

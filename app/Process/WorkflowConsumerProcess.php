@@ -43,6 +43,9 @@ class WorkflowConsumerProcess extends AbstractProcess
 
         echo sprintf("[workflow-consumer] starting, pool=%d\n", $poolSize);
 
+        // 回调对账器:回调丢失兜底(pollUrl 状态查询自愈 / deadline 超时置败)
+        \App\Workflow\Engine\CallbackReconciler::start();
+
         TaskQueueFactory::make()->consume(function (array $message): void {
             $type = (string) ($message['type'] ?? '');
             $application = \Hyperf\Context\ApplicationContext::getContainer()->get(WorkflowApplication::class);
