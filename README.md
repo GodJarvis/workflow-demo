@@ -288,6 +288,8 @@ POST /workflow/callback  ──落库→ 投"继续消息" → 202(毫秒返回)
    状态:report 轮询 / GET /workflow/events(SSE progress/done 事件)
 ```
 
+**双队列双进程(run / callback 拆分)**:任务执行(重且长)与回调推进(轻且快)物理隔离——`RunConsumerProcess`(run 队列,`run_pool_size`)与 `CallbackConsumerProcess`(callback 队列 + 对账器,`callback_pool_size`)。**拆分收益实测**:run 池被 4 个长任务(all-languages ~2.5s)占满期间,回调推进仅 **0.52s** 完成(混池时会排队等池空闲);独立扩缩容(run 按负载扩、callback 恒定小池)、故障隔离(沙箱执行异常不波及回调)。物理拆分是必须的:Redis Stream 同组竞争会把 run 消息分给回调进程,语义队列必须独立。
+
 **双队列实现**(config `workflow.task_queue`,与五 Registry 的广播语义对照——**任务队列=竞争消费,唤醒=广播**):`redis_stream`(默认,单组多 consumer)/ `rabbitmq`(work queue:durable + persistent + ACK,跨重启不丢)。
 
 **验证**:批量 20 并发提交 19ms 全收 → 池化消化;异步回调闭环(async-run→waiting→callback 入队→消费进程推进→success);SSE progress/done 正常;RabbitMQ 队列消费干净(messages=0);**同步模式零破坏**(等待者升级为"短周期 pop + 任务终态感知":被消费进程推进后 ≤3s 从 checkpoint 收敛,executeNode 链路幂等)。

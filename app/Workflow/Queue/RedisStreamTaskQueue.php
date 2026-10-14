@@ -19,9 +19,11 @@ use Swoole\Coroutine;
  */
 class RedisStreamTaskQueue implements TaskQueueInterface
 {
-    private const STREAM_KEY = 'workflow-task-queue';
-
     private const GROUP = 'wg-task-consumer';
+
+    public function __construct(private readonly string $streamKey)
+    {
+    }
 
     public function publish(array $message): bool
     {
@@ -30,7 +32,7 @@ class RedisStreamTaskQueue implements TaskQueueInterface
             return false;
         }
         try {
-            $redis->xAdd(self::STREAM_KEY, '*', ['payload' => json_encode($message, JSON_UNESCAPED_UNICODE)]);
+            $redis->xAdd($this->streamKey, '*', ['payload' => json_encode($message, JSON_UNESCAPED_UNICODE)]);
             return true;
         } catch (\Throwable) {
             return false;
@@ -45,7 +47,7 @@ class RedisStreamTaskQueue implements TaskQueueInterface
         $boot = WaiterRedisConnection::connect(3);
         if ($boot !== null) {
             try {
-                $boot->xGroup('CREATE', self::STREAM_KEY, self::GROUP, '0', true);   // MKSTREAM
+                $boot->xGroup('CREATE', $this->streamKey, self::GROUP, '0', true);   // MKSTREAM
             } catch (\Throwable) {
                 // BUSYGROUP: 已存在
             }
@@ -65,19 +67,19 @@ class RedisStreamTaskQueue implements TaskQueueInterface
                             continue;
                         }
                         while (true) {
-                            $messages = $redis->xReadGroup(self::GROUP, $consumer, [self::STREAM_KEY => '>'], 1, 60000);
+                            $messages = $redis->xReadGroup(self::GROUP, $consumer, [$this->streamKey => '>'], 1, 60000);
                             if ($messages === false || $messages === []) {
                                 continue;
                             }
-                            foreach ($messages[self::STREAM_KEY] ?? [] as $messageId => $fields) {
+                            foreach ($messages[$this->streamKey] ?? [] as $messageId => $fields) {
                                 $payload = json_decode((string) ($fields['payload'] ?? '{}'), true);
                                 if (! is_array($payload)) {
-                                    $redis->xAck(self::STREAM_KEY, self::GROUP, [$messageId]);   // 坏消息直接确认丢弃
+                                    $redis->xAck($this->streamKey, self::GROUP, [$messageId]);   // 坏消息直接确认丢弃
                                     continue;
                                 }
                                 try {
                                     $handler($payload);
-                                    $redis->xAck(self::STREAM_KEY, self::GROUP, [$messageId]);   // 处理成功才 ACK
+                                    $redis->xAck($this->streamKey, self::GROUP, [$messageId]);   // 处理成功才 ACK
                                 } catch (\Throwable) {
                                     // 不 ACK:留在 pending,重启后 XAUTOCLAIM 重投(at-least-once)
                                 }

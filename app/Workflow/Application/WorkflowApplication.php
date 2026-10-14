@@ -121,7 +121,7 @@ class WorkflowApplication
             json_encode(['inputs' => $inputs], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT),
         );
 
-        $queued = \App\Workflow\Queue\TaskQueueFactory::make()->publish(['type' => 'run', 'taskID' => $taskID]);
+        $queued = \App\Workflow\Queue\TaskQueueFactory::make('run')->publish(['type' => 'run', 'taskID' => $taskID]);
         if (! $queued) {
             $this->tasks->update($taskID, ['status' => 'failed', 'error' => 'task queue publish failed']);
             throw new \RuntimeException('task queue unavailable (check workflow.task_queue config)');
@@ -203,8 +203,8 @@ class WorkflowApplication
         // ① 落库(审计与幂等的事实源)
         $factState = $this->tasks->saveCallbackFact($taskID, $taskId, ['outputs' => $outputs]);
 
-        // ② 入队(毫秒级返回;推进由消费进程 handleCallbackMessage 单点执行)
-        $queued = \App\Workflow\Queue\TaskQueueFactory::make()->publish([
+        // ② 入队(callback 专用队列:独立池处理,不受 run 长任务拖累;毫秒级返回)
+        $queued = \App\Workflow\Queue\TaskQueueFactory::make('callback')->publish([
             'type' => 'callback',
             'externalTaskId' => $taskId,
             'outputs' => $outputs,

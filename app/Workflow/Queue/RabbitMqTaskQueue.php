@@ -20,7 +20,9 @@ use Swoole\Coroutine;
  */
 class RabbitMqTaskQueue implements TaskQueueInterface
 {
-    private const QUEUE = 'workflow-task-queue';
+    public function __construct(private readonly string $queue)
+    {
+    }
 
     public function publish(array $message): bool
     {
@@ -30,14 +32,14 @@ class RabbitMqTaskQueue implements TaskQueueInterface
         }
         try {
             $channel = $connection->channel();
-            $channel->queue_declare(self::QUEUE, false, true, false, false);   // durable
+            $channel->queue_declare($this->queue, false, true, false, false);   // durable
             $channel->basic_publish(
                 new AMQPMessage(json_encode($message, JSON_UNESCAPED_UNICODE), [
                     'content_type' => 'application/json',
                     'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT,   // 持久化消息
                 ]),
                 '',
-                self::QUEUE,
+                $this->queue,
             );
             $channel->close();
             return true;
@@ -61,9 +63,9 @@ class RabbitMqTaskQueue implements TaskQueueInterface
                             continue;
                         }
                         $channel = $connection->channel();
-                        $channel->queue_declare(self::QUEUE, false, true, false, false);
+                        $channel->queue_declare($this->queue, false, true, false, false);
                         $channel->basic_qos(null, 1, null);   // prefetch=1:处理完再取下一条
-                        $channel->basic_consume(self::QUEUE, '', false, false, false, false,
+                        $channel->basic_consume($this->queue, '', false, false, false, false,
                             function (AMQPMessage $message) use ($handler): void {
                                 $payload = json_decode((string) $message->getBody(), true);
                                 if (is_array($payload)) {

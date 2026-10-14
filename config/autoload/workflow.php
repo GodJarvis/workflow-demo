@@ -59,8 +59,9 @@ return [
     //   'rabbitmq'           —— RabbitMQ work queue(durable+persistent+ACK,跨重启不丢)
     'task_queue' => 'redis_stream',
 
-    // 消费进程协程池大小 = 工作流并发上限(削峰;超过的任务在队列排队)
-    'consumer_pool_size' => 4,
+    // 双消费进程池大小(run/callback 拆分:回调延迟不受长任务拖累、独立扩缩容、故障隔离)
+    'run_pool_size' => 4,        // 任务执行池(重且长:沙箱/LLM;按负载扩)
+    'callback_pool_size' => 2,   // 回调推进池(轻且快:对延迟敏感,恒定小池)
 
     // 回调对账器间隔(秒):扫描等待回调的任务 → pollUrl 状态查询自愈 / deadline 超时置败
     // (演示可调短,如 10;生产 30~60)
