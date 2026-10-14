@@ -10,15 +10,200 @@
 CLI bin/hyperf.php ─┐
                     ├─→ WorkflowApplication ─→ Engine(调度器,协程并发)
 HTTP :9501 ─────────┘        │                    │
-                             │                    ├─ Start/End/Condition Executor(进程内)
-                             │                    └─ CodeExecutor ─→ SandboxRunner
-                             │                                        │ Docker Engine API(unix socket)
-                             │                                        ▼
-                             └─ TaskStore / SnapshotCenter      一次性沙箱容器
-                                .runs/<taskID>/                  wf-sandbox-{python,node,php}
-                                ├── task.json       任务状态机     (cgroup限额/禁网/只读/seccomp/非root)
+                             │                    ├─ Start/End/Condition/LLM/Video Executor(进程内)
+                             │                    └─ CodeExecutor ─→ SandboxDriverFactory
+                             │                                        ├ process 档(setpriv+UID池+ulimit)
+                             │                                        ├ docker 档(一次性容器,五语言)
+                             │                                        └ dify 档(HTTP→dify-sandbox 服务)
+                             │
+                             ├─ [异步模式] TaskQueue(RabbitMQ/Redis Stream 双语义队列)
+                             │     ├ workflow-run-queue ──→ RunConsumerProcess(执行池)
+                             │     └ workflow-callback-queue → CallbackConsumerProcess
+                             │                                 (回调池 + CallbackReconciler 对账)
+                             │
+                             └─ TaskStore / SnapshotCenter      CallbackWaiterRegistry(五实现)
+                                .runs/<taskID>/                  memory|table|redis_pubsub
+                                ├── task.json       任务状态机     |redis_stream|rabbitmq
                                 ├── checkpoint.json ★可序列化Context
                                 └── report.json     逐节点快照(inputs/outputs/logs/耗时/branch)
+```
+
+### Engine 全链路调度流程图(同步等待 + 异步任务)
+
+> 介质示例:taskQueue = **RabbitMQ**(run/callback 双队列)· waiter = **RabbitMQ**(fanout 广播)· 代码节点沙箱 = **difySandbox**
+> 示例 DSL:`start → clean(code·python) → check(condition) → render(video·异步回调) → end`
+
+**调度核心**(executeNode 递归,两种模式共用):
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Engine::process → executeNode(start) 递归            │
+│ ① canExecute:前驱全 executed?否→静默 return(汇聚)   │
+│ ② 流值解析:constant / ref / template                │
+│ ③ executor.execute → {outputs, branch?}              │
+│ ④ 写变量存储 + 标记 executed + checkpoint 落盘       │
+│ ⑤ getNextNodes:按 branch 裁边;被剪支后代标记        │
+│    executed(skipped)防汇聚死等                       │
+│ ⑥ executeNext:Coroutine::create 并发推进后继         │
+└──────────────────────────────────────────────────────┘
+```
+
+```mermaid
+flowchart TB
+    P["Engine::process"] --> N["executeNode(start) 递归"]
+    N --> C1{"① 前驱全 executed?"}
+    C1 -- "否" --> W["静默 return<br/>(等其它分支触发 = 汇聚)"]
+    C1 -- "是" --> C2["② 流值解析<br/>constant / ref / template"]
+    C2 --> E["③ executor.execute<br/>→ {outputs, branch?}"]
+    E --> V["④ 写变量存储 + 标记 executed<br/>+ checkpoint 落盘"]
+    V --> G["⑤ getNextNodes 按 branch 裁边<br/>被剪支后代标记 executed 防汇聚死等"]
+    G --> X["⑥ executeNext<br/>Coroutine::create 并发推进"]
+    X --> N2["executeNode(后继)… 递归"]
+```
+
+**模式一:同步等待**(HTTP run / CLI,连接保持到工作流完成):
+
+```
+【终端A】 POST /workflow/run {inputs}
+   │
+【API进程】S1 校验DSL → Task创建 → Context(inputs→start域) → Engine::process
+   │           └ executeNode 递归:start ✓ → clean 触发
+   │
+【API进程】S2 clean 节点(CodeExecutor · difySandbox 档)
+   │           DifySandboxDriver 协议转换:params 内联 + main() 协议包装
+   │           + __WF_OUTPUT__ 标记行
+   │              └──────▶【dify-sandbox :8194】S3
+   │                          UID池借号 → chroot+no_new_privs+seccomp锁
+   │                          → 锁内执行 python(锁前 preload 可装依赖)
+   │           ◀────── S4 stdout 回收 __WF_OUTPUT__ → 代写 output.json
+   │           clean ✓ → check ✓(条件求值→branch)→ render 触发
+   │
+【API进程】S5 render 节点(VideoExecutor · asyncCallback · 同步模式)
+   │           indexCallback 落盘:taskId→node 索引 + pollUrl + deadline
+   │           RabbitMqWaiterRegistry.register:
+   │             本地静态表 taskId→Channel
+   │             + exclusive 队列 bind fanout exchange(连接断开自动删)
+   │           ★协程挂起 Channel::pop(3s短周期)← 等待者在本进程
+   │             (每3s醒来查任务终态 → 感知任意推进方后从checkpoint收敛)
+   │
+   │           ══ 此时:1连接+1等待协程,事件驱动等待 ══
+   │
+【终端B·外部系统】 POST /workflow/callback {taskId, outputs}(X-Callback-Token)
+   │
+【API进程】C1 落库事实源(.runs/<taskID>/callbacks/<taskId>.json)
+   │           C2 投 RabbitMQ workflow-callback-queue → 202 毫秒返回
+   │
+【CallbackConsumerProcess】(独立进程 · callback_pool_size)
+   │           C3 handleCallbackMessage → deliver:
+   │              basic_publish → fanout exchange(广播)
+   │                 └▶【API进程】常驻订阅协程(翻译器)收到消息
+   │                    → 本地 Registry 查 Channel → push ★最后一跳
+   │                    (Channel 永不出进程;跨进程流动的只有 taskId+outputs)
+   │           C4 deliver 未命中时(异步任务无等待者):
+   │              completeExternalTask:checkpoint 重载 → 补写 outputs
+   │              → 推进后继(与 executeNode 成功路径同构,幂等)
+   │
+【API进程】S7 等待协程被 push 唤醒 → outputs → 快照/checkpoint
+   │           → getNextNodes → end(前驱全 executed→汇聚触发)→ success
+   │           → runInCoroutine 完成信号 → HTTP 响应返回
+   │
+【终端A】 ◀══ {status, outputs}(全程一次连接)
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as 终端A(同步请求)
+    participant API as API进程(HTTP worker)
+    participant SBX as dify-sandbox :8194
+    participant MQ as RabbitMQ
+    participant CB as CallbackConsumerProcess
+    participant EXT as 终端B/外部系统
+
+    A->>API: POST /workflow/run {inputs}
+    Note over API: S1 校验DSL/建Task/Context → Engine::process<br/>start ✓ → clean 触发
+    API->>SBX: S2 POST /v1/sandbox/run<br/>(params内联 + main协议 + __WF_OUTPUT__)
+    Note over SBX: S3 UID池降权 → chroot+seccomp锁<br/>锁内执行 python
+    SBX-->>API: S4 stdout(含 __WF_OUTPUT__)
+    Note over API: 代写 output.json → clean ✓ → check ✓ → render
+    Note over API: S5 索引落盘(taskId+pollUrl+deadline)<br/>RabbitMqWaiter:本地Channel + exclusive队列 bind fanout<br/>★协程 pop(3s)挂起 = 等待者
+    EXT->>API: POST /workflow/callback {taskId,outputs}
+    Note over API: C1 落库事实源(callbacks/xx.json)
+    API->>MQ: C2 投 workflow-callback-queue
+    API-->>EXT: 202(毫秒返回)
+    MQ->>CB: C3 消费
+    CB->>MQ: deliver → basic_publish 到 fanout exchange
+    MQ-->>API: 常驻订阅协程(翻译器)收到广播
+    Note over API: 本地 Registry 查 Channel → push ★最后一跳<br/>(Channel 永不出进程)
+    opt deliver 未命中(异步任务无等待者)
+        Note over CB: C4 completeExternalTask:checkpoint 重载<br/>→ 补写 outputs → 推进后继(幂等)
+    end
+    Note over API: S7 等待协程被唤醒 → render ✓<br/>→ end(汇聚)→ success
+    API-->>A: {status, outputs}(全程一次连接)
+```
+
+**模式二:异步任务**(POST /async-run,连接毫秒释放,池化消费):
+
+```
+【客户端】 POST /workflow/async-run
+   │
+【API进程】A1 校验 + Task(queued) + inputs.json 落盘
+   │           A2 投 RabbitMQ workflow-run-queue → 202 {taskID}(实测15ms)
+   │
+【RunConsumerProcess】(独立进程 · run_pool_size)
+   │           A3 executeTask(AsyncContext 队列模式):读 inputs → Engine::process
+   │              start ✓ → clean(dify沙箱,同 S2-S4)✓ → check ✓ → render:
+   │           A4 注册索引(taskId+pollUrl+deadline)后
+   │              ★抛 TaskDeferredException(不挂起!)
+   │              Engine 感知:节点 waiting + checkpoint → 任务保持 running
+   │              → executeTask 返回 → ★消费协程立即归还池子
+   │              (等待回调任务 = 0连接+0协程,数量仅受存储容量约束)
+   │
+   │           ══ 回调推进(同 C1→C2→C4):deliver 未命中(无等待者)
+   │              → completeExternalTask:checkpoint 重载 → render ✓
+   │              → 后继若又遇 deferred → 再次暂停(多段异步天然支持)
+   │              → end ✓ → 终态 success ══
+   │
+【客户端】 GET /workflow/events(SSE:progress/done)或 POST /report 查询
+```
+
+```mermaid
+flowchart TB
+    C(["客户端"]) -->|"POST /async-run"| A1["A1 API进程<br/>校验 + Task(queued) + inputs.json"]
+    A1 -->|"A2 投队列 → 202 {taskID}(15ms)"| RQ[["RabbitMQ<br/>workflow-run-queue"]]
+    RQ --> RC["A3 RunConsumerProcess(执行池)<br/>executeTask 队列模式:<br/>start✓ → clean(dify沙箱)✓ → check✓"]
+    RC --> DF["A4 render:注册索引后<br/>★抛 TaskDeferredException(不挂起)"]
+    DF --> PAUSE["Engine:节点waiting + checkpoint<br/>任务保持 running → ★消费协程归还池<br/>(等待 = 0连接 0协程,不受池大小限制)"]
+    EXT2(["外部系统"]) -->|"POST /callback"| API2["API:落库 → 投回调队列"]
+    API2 --> CQ[["RabbitMQ<br/>workflow-callback-queue"]]
+    CQ --> CC["CallbackConsumerProcess(回调池)"]
+    CC -->|"deliver 未命中(无等待者)"| CE["completeExternalTask<br/>checkpoint 重载 → render ✓"]
+    CE -->|"后继又遇 deferred"| PAUSE
+    CE --> END2["end ✓ → success"]
+    PAUSE -.->|"再次等待回调"| CQ
+    END2 --> SSE(["客户端:SSE progress/done<br/>或 report 查询"])
+```
+
+**兜底:CallbackReconciler**(回调丢失自愈,跑在 CallbackConsumerProcess):
+
+```
+定时扫描(config reconcile_interval)未了结的回调索引:
+  ├ 有 pollUrl → HTTP 查询外部状态
+  │    succeeded → 充当"迟到的回调"(走 C3/C4 同一路径)自愈推进
+  │    failed    → 任务置败(failExternalTask:checkpoint 恢复现场)
+  └ 超 deadline(pollTimeout)→ 置败 "callback lost"
+与回调并发撞车由 completeExternalTask 的 isExecutedNode 幂等兜底(先到先赢)
+```
+
+```mermaid
+flowchart TB
+    T["CallbackReconciler<br/>定时扫描(reconcile_interval)"] --> I{"回调索引中<br/>未了结的 taskId"}
+    I -->|"有 pollUrl"| P["HTTP 查询外部状态"]
+    P -->|"succeeded"| H["充当迟到的回调<br/>C3/C4 同路径自愈推进"]
+    P -->|"failed"| F["任务置败<br/>failExternalTask(checkpoint 恢复现场)"]
+    P -->|"processing / 查询失败"| W["继续等下一轮"]
+    I -->|"超 deadline(pollTimeout)"| L["置败 callback lost"]
+    H -.->|"与回调并发"| ID["completeExternalTask<br/>isExecutedNode 幂等:先到先赢"]
 ```
 
 ### 调度模型(与 FlowGram 一致)
