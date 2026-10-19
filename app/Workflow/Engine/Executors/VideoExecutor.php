@@ -152,7 +152,8 @@ class VideoExecutor implements NodeExecutorInterface
         //    deadline:回调丢失超时线(now + data.pollTimeout,默认 600s)
         $pollUrl = isset($node->data['pollUrl']) ? (string) $node->data['pollUrl'] : null;
         $deadline = microtime(true) + (float) ($node->data['pollTimeout'] ?? 600);
-        $tasks->indexCallback($taskId, $context->taskID, $node->id, $pollUrl, $deadline);
+        $queued = \App\Workflow\Engine\AsyncContext::isQueueMode();
+        $tasks->indexCallback($taskId, $context->taskID, $node->id, $pollUrl, $deadline, $queued);
         $context->nodeStatuses[$node->id] = 'waiting';
 
         // ── 队列模式(异步消费):注册即暂停,释放消费协程 ──

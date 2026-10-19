@@ -54,14 +54,13 @@ return [
         'vhost' => '/',
     ],
 
-    // ★ 任务队列(生产形态:async-run 入队 / 回调推进,消费者见 app/Process/WorkflowConsumerProcess)
+    // ★ 任务队列(生产形态:async-run 入队 / 回调 resume 推进,唯一执行器见 app/Process/RunConsumerProcess)
     //   'redis_stream'(默认)—— Redis Stream 单组竞争消费(每任务只处理一次;XACK/断线补读)
     //   'rabbitmq'           —— RabbitMQ work queue(durable+persistent+ACK,跨重启不丢)
     'task_queue' => 'redis_stream',
 
-    // 双消费进程池大小(run/callback 拆分:回调延迟不受长任务拖累、独立扩缩容、故障隔离)
-    'run_pool_size' => 4,        // 任务执行池(重且长:沙箱/LLM;按负载扩)
-    'callback_pool_size' => 2,   // 回调推进池(轻且快:对延迟敏感,恒定小池)
+    // 唯一执行器进程的协程池大小 = 工作流并发上限(run/resume 消息统一消费;削峰)
+    'run_pool_size' => 4,
 
     // 回调对账器间隔(秒):扫描等待回调的任务 → pollUrl 状态查询自愈 / deadline 超时置败
     // (演示可调短,如 10;生产 30~60)

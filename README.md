@@ -473,7 +473,7 @@ POST /workflow/callback  ──落库→ 投"继续消息" → 202(毫秒返回)
    状态:report 轮询 / GET /workflow/events(SSE progress/done 事件)
 ```
 
-**双队列双进程(run / callback 拆分)**:任务执行(重且长)与回调推进(轻且快)物理隔离——`RunConsumerProcess`(run 队列,`run_pool_size`)与 `CallbackConsumerProcess`(callback 队列 + 对账器,`callback_pool_size`)。**拆分收益实测**:run 池被 4 个长任务(all-languages ~2.5s)占满期间,回调推进仅 **0.52s** 完成(混池时会排队等池空闲);独立扩缩容(run 按负载扩、callback 恒定小池)、故障隔离(沙箱执行异常不波及回调)。物理拆分是必须的:Redis Stream 同组竞争会把 run 消息分给回调进程,语义队列必须独立。
+**统一执行器架构(单队列单进程,CallbackConsumerProcess 已退役)**:`RunConsumerProcess` 是**唯一执行器**(run 队列,`run_pool_size`,消息两类:`{type:'run'}` 全新执行 / `{type:'resume'}` 重载推进——completeExternalTask 与 executeTask 同为"驱动工作流前进",推进后继可能跑沙箱属任意重操作,归同一执行池**公平排队**);同时承载 `CallbackReconciler`(对账:自愈→投 resume / deadline 置败)。回调 API 直投(毫秒):落库 → 同步任务 deliver 广播快路径(等待者毫秒级唤醒;memory/table 下等待者若恰在本 API worker 可直接 `in_process` 命中,比独立回调进程更快)→ 投 run 队列 resume(去掉 callback 队列中转一跳 RTT)。**轻重分离**:回调轻部分(落库+广播)在 API 侧不排队;重部分(resume 推进)在 run 池排队——坑 22 公平性原则依然成立。同一任务 run/resume 消息同队列 FIFO 天然串行,双推进竞态极少发生。
 
 **双队列实现**(config `workflow.task_queue`,与五 Registry 的广播语义对照——**任务队列=竞争消费,唤醒=广播**):`redis_stream`(默认,单组多 consumer)/ `rabbitmq`(work queue:durable + persistent + ACK,跨重启不丢)。
 
@@ -488,7 +488,7 @@ POST /workflow/callback  ──落库→ 投"继续消息" → 202(毫秒返回)
 
 实测:poolSize=4 下提交 6 个回调等待流(全部 running 暂停)→ **第 7 个普通任务 2 秒完成**(池空闲证明)→ 逐个回调推进 6/6 success。推进链遇下一个 deferred 节点会再次暂停(`advanceExternalTask` 同在队列模式);同步模式(HTTP/CLI run)不受影响,仍走协程挂起 + 终态感知收敛。
 
-**回调对账兜底(Reconciliation)**:回调是"外部主动告知",天然不可靠——`CallbackReconciler`(消费进程内定时协程,config `reconcile_interval` 默认 30s)扫描所有未了结的回调索引:有 `pollUrl`(注册时随索引持久化的外部状态查询句柄)则主动 HTTP 查询,`succeeded` 充当"迟到的回调"推进(与回调路径同一收敛点,幂等)、`failed` 置败;超过 `deadline`(`pollTimeout`,默认 600s)则置败"callback lost"。**示例 `examples/reconcile-flow.json`**(pollUrl 指向 `/workflow/mock-status` 模拟外部系统,pollTimeout=45s):剧本A 回调丢失自愈(写 mock 文件→对账器 10s 内查询自愈推进,实测 success);剧本B 超时置败(45s failed "external callback lost");回调优先回归(正常回调即时,对账器不干扰)。教学:`.runs/<taskID>/mock-external/<taskId>.json` 即模拟外部状态的写入口。
+**回调对账兜底(Reconciliation,独立 command 定时任务)**:回调是"外部主动告知",天然不可靠——`workflow:reconcile` 命令(与执行器进程**完全解耦**,config `reconcile_interval` 为默认轮间隔):**默认单轮执行后退出,由 crontab 调度**(`* * * * * docker exec wf-engine sh -c "cd /var/project/workflow-demo && php bin/hyperf.php workflow:reconcile"`),亦支持 `--rounds=0 --interval=10` 常驻轮询(无 crontab 环境/演示)。收益:对账频率独立于执行器配置、执行器重启/扩缩容不影响对账、多实例错峰;每轮输出统计(`scanned/healed/externalFailed/timedOut`)。轮内逻辑:有 `pollUrl`(注册时随索引持久化)→ HTTP 查询,`succeeded` 投 run 队列 resume 自愈推进(与回调同一收敛点,幂等)、`failed` 置败;超 `deadline`(pollTimeout)置败 "callback lost"。**示例 `examples/reconcile-flow.json`**(pollUrl 指向 `/workflow/mock-status`,pollTimeout=45s):写 mock 文件后手动跑一次命令即自愈(实测 success);deadline 过期跑命令即置败;教学:`.runs/<taskID>/mock-external/<taskId>.json` 即模拟外部状态的写入口。
 
 ## 已知简化(demo → 生产的差距)
 

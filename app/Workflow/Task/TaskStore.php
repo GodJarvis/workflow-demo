@@ -105,7 +105,7 @@ class TaskStore
         file_put_contents(rtrim($this->runsDir, '/') . '/callback-index.json', json_encode($index, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
     }
 
-    public function indexCallback(string $taskId, string $taskID, string $nodeID, ?string $pollUrl = null, ?float $deadline = null): void
+    public function indexCallback(string $taskId, string $taskID, string $nodeID, ?string $pollUrl = null, ?float $deadline = null, ?bool $queued = null): void
     {
         $index = $this->loadCallbackIndex();
         $index[$taskId] = [
@@ -115,6 +115,9 @@ class TaskStore
             // 对账兜底凭据:pollUrl=外部状态查询句柄({taskId} 占位);deadline=回调丢失超时线
             'pollUrl' => $pollUrl,
             'deadline' => $deadline,
+            // 任务注册时是否为队列模式:queued=true 时回调方跳过广播投递(必然空喊,
+            // 无任何订阅者——等待者在 register 之前就抛 TaskDeferredException 释放了)
+            'queued' => $queued,
         ];
         $this->saveCallbackIndex($index);
     }

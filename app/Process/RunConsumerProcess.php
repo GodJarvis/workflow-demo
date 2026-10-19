@@ -11,13 +11,12 @@ use Hyperf\Process\AbstractProcess;
 /**
  * 任务执行消费进程:消费 run 队列(重且长的负载 —— 沙箱/LLM 执行)
  *
- * 与 CallbackConsumerProcess 拆分的理由(独立队列独立进程独立池):
- *   ① 回调延迟不被长任务拖累(混池时池满 → 回调排队)
- *   ② 独立扩缩容:run 池按负载扩(run_pool_size),callback 池恒定小池
- *   ③ 故障隔离:沙箱执行异常不影响回调推进
- *   注意:Redis Stream 同组竞争会把 run 消息分给回调进程,必须物理分队列
- *
- * 消息:{type:'run', taskID} → executeTask(AsyncContext 队列模式:deferred 暂停释放协程)
+ * 唯一执行器(CallbackConsumerProcess 已退役,其路由职责并入 API 侧):
+ *   消息:{type:'run', taskID}    → executeTask(全新执行)
+ *        {type:'resume', taskId} → completeExternalTask(重载推进,可能跑后继沙箱
+ *                                  —— 与 run 同为任意重操作,归同一池公平排队)
+ * 同一任务的 run/resume 消息同队列 FIFO → 天然串行,双推进竞态极少发生
+ * 对账已解耦:CallbackReconciler 独立为 workflow:reconcile command(crontab 调度)
  */
 class RunConsumerProcess extends AbstractProcess
 {
@@ -35,11 +34,27 @@ class RunConsumerProcess extends AbstractProcess
         echo sprintf("[run-consumer] starting, pool=%d\n", $poolSize);
 
         TaskQueueFactory::make('run')->consume(function (array $message): void {
-            $taskID = (string) ($message['taskID'] ?? '');
-            if (($message['type'] ?? '') === 'run' && $taskID !== '') {
-                echo "[run-consumer] run {$taskID}\n";
-                \Hyperf\Context\ApplicationContext::getContainer()
-                    ->get(WorkflowApplication::class)->executeTask($taskID);
+            $type = (string) ($message['type'] ?? '');
+            $application = \Hyperf\Context\ApplicationContext::getContainer()->get(WorkflowApplication::class);
+
+            switch ($type) {
+                case 'run':
+                    $taskID = (string) ($message['taskID'] ?? '');
+                    if ($taskID !== '') {
+                        echo "[run-consumer] run {$taskID}\n";
+                        $application->executeTask($taskID);
+                    }
+                    break;
+
+                case 'resume':
+                    // 统一推进:callback 路由层投递(队列任务唯一路径/同步任务双保险)
+                    $externalTaskId = (string) ($message['externalTaskId'] ?? '');
+                    if ($externalTaskId !== '') {
+                        echo "[run-consumer] resume {$externalTaskId}\n";
+                        $outputs = is_array($message['outputs'] ?? null) ? $message['outputs'] : [];
+                        $application->resumeExternalTask($externalTaskId, $outputs);
+                    }
+                    break;
             }
         }, $poolSize);
     }

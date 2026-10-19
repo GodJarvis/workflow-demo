@@ -99,7 +99,7 @@ class WorkflowController
 
     /**
      * POST /workflow/async-run — 生产形态入口:校验+建 Task+入队,毫秒级返回 taskID
-     * 执行由独立消费进程(WorkflowConsumerProcess)池化完成,连接不阻塞;
+     * 执行由唯一执行器进程(RunConsumerProcess)池化完成,连接不阻塞;
      * 进度经 GET /workflow/events(SSE)或 POST /workflow/report 查询
      */
     public function asyncRun(RequestInterface $request): array

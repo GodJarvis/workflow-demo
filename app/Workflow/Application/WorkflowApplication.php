@@ -105,7 +105,7 @@ class WorkflowApplication
 
     /**
      * 异步提交(生产形态):校验 + 建 Task(queued) + inputs 持久化 + 入队
-     * 毫秒级返回 taskID;执行由 WorkflowConsumerProcess(独立进程消费池)完成
+     * 毫秒级返回 taskID;执行由 RunConsumerProcess(唯一执行器进程)完成
      * 结果经 report 轮询 / SSE(workflow/events)获取
      */
     public function submit(string $workflowFile, array $inputs): string
@@ -169,28 +169,51 @@ class WorkflowApplication
     }
 
     /**
-     * 消费进程处理回调消息:单点决策消灭双推进竞态
-     *   ① Registry deliver(同步模式等待者即时唤醒,若可命中)→ 完成
-     *   ② 未命中(异步任务无等待者/等待者已死)→ checkpoint 重载推进(幂等)
+     * 消费进程处理回调消息:推进决策
+     *   ① deliver 返回 'in_process'(本地等待者命中)→ 唯一确定唤醒,等待方主流程收尾
+     *   ② 其余(delivered 到介质的 'amqp'/'pubsub'/'stream'/'pipe_message',或 'none')
+     *      → 统一走 checkpoint 重载推进。原因:广播型返回值只代表"已投递到 exchange",
+     *        不保证有人认领 —— 队列模式任务从未 register 等待者(抛 TaskDeferredException
+     *        在 register 之前),广播是空喊,若在此返回则任务永不推进(回归 bug 修复点)。
+     *        同步模式下广播可能同时也唤醒了等待者 → 双推进由 completeExternalTask 的
+     *        isExecutedNode 幂等兜底(先到先赢,后到对同 outputs 重写同值,结果一致)
      * @param array<string, mixed> $outputs
      * @return array<string, mixed>
      */
-    public function handleCallbackMessage(string $externalTaskId, array $outputs): array
+    /**
+     * 投递 resume 消息到 run 队列(统一执行入口;public 供 Reconciler 等复用)
+     */
+    public function dispatchResume(string $externalTaskId, array $outputs): bool
     {
-        $registry = \App\Workflow\Engine\Waiter\WaiterRegistryFactory::make();
-        $delivered = $registry->deliver($externalTaskId, $outputs);
-        if ($delivered !== 'none') {
-            // 同步等待者已被唤醒(等待方主流程收尾)
-            $this->tasks->unindexCallback($externalTaskId);
-            return ['delivered' => $delivered, 'note' => 'waiter resumed'];
-        }
-        return $this->advanceUnclaimed($externalTaskId, $outputs);
+        return \App\Workflow\Queue\TaskQueueFactory::make('run')->publish([
+            'type' => 'resume',
+            'externalTaskId' => $externalTaskId,
+            'outputs' => $outputs,
+        ]);
     }
 
     /**
-     * 外部回调处理(黄金法则:API 只做落库+入队,推进在消费进程)
+     * resume 消息处理(RunConsumerProcess,唯一执行器,队列模式):
+     * 统一重载推进(completeExternalTask 幂等 —— 同步等待者若已被广播唤醒,
+     * 此处 isExecutedNode 直接返回现状;未唤醒则由此推进,等待者 3s 感知收敛)
+     * @param array<string, mixed> $outputs
+     * @return array<string, mixed>
+     */
+    public function resumeExternalTask(string $externalTaskId, array $outputs): array
+    {
+        $this->advanceUnclaimed($externalTaskId, $outputs);
+        return ['completed' => true];
+    }
+
+    /**
+     * 外部回调处理(API 入口直投,毫秒级;CallbackConsumerProcess 已退役):
      *   ① 落库(事实源,无论后续如何)
-     *   ② 投递"继续消息"到任务队列 → 消费者单点推进(削峰+同任务 FIFO 串行化)
+     *   ② 同步任务(queued=false)→ deliver 广播:等待者毫秒级唤醒 —— API worker 顺手
+     *      一次 publish/sendMessage(轻操作);memory/table 模式下等待者若恰在本 worker
+     *      可直接 in_process 命中(比经由独立回调进程更快)
+     *   ③ 投 run 队列 {type:'resume'} 统一推进(队列任务唯一路径;同步任务幂等双保险)
+     * 轻重分离:回调的轻部分(落库+广播)在 API 侧不排队;重部分(resume 推进,可能跑
+     * 后继沙箱)在 run 池公平排队 —— 坑 22 的公平性原则依然成立
      * @param array<string, mixed> $outputs
      * @return array<string, mixed>
      */
@@ -203,31 +226,35 @@ class WorkflowApplication
         // ① 落库(审计与幂等的事实源)
         $factState = $this->tasks->saveCallbackFact($taskID, $taskId, ['outputs' => $outputs]);
 
-        // ② 入队(callback 专用队列:独立池处理,不受 run 长任务拖累;毫秒级返回)
-        $queued = \App\Workflow\Queue\TaskQueueFactory::make('callback')->publish([
-            'type' => 'callback',
-            'externalTaskId' => $taskId,
-            'outputs' => $outputs,
-        ]);
+        // ② 同步任务:deliver 广播快路径(队列任务无等待者,跳过省一次 publish)
+        $delivered = 'skipped(queued task)';
+        if (($entry['queued'] ?? null) !== true) {
+            $registry = \App\Workflow\Engine\Waiter\WaiterRegistryFactory::make();
+            $delivered = $registry->deliver($taskId, $outputs);
+        }
+
+        // ③ 直投 run 队列 resume(去掉 callback 队列中转的一跳 RTT)
+        $queued = $this->dispatchResume($taskId, $outputs);
         if (! $queued) {
             throw new \RuntimeException('task queue unavailable on callback dispatch');
         }
 
         return [
-            'queued' => true,
             'fact' => $factState,
             'taskID' => $taskID,
-            'note' => 'dispatched to task queue; consumer will advance the workflow',
+            'delivered' => $delivered,
+            'dispatched' => 'resume',
+            'note' => 'broadcast for sync waiter + resume to unified executor',
         ];
     }
 
     /**
      * 翻译器(Table onPipeMessage / 订阅协程)发现"无人认领"时的兜底入口
-     * (静态形式便于非容器上下文调用;协程内执行)
+     * (静态形式便于非容器上下文调用;统一投 run 队列 resume,不在调用方进程执行推进)
      */
     public static function handleUnclaimedCallback(string $taskId, array $outputs): void
     {
-        ApplicationContext::getContainer()->get(self::class)->advanceUnclaimed($taskId, $outputs);
+        ApplicationContext::getContainer()->get(self::class)->dispatchResume($taskId, $outputs);
     }
 
     /**
